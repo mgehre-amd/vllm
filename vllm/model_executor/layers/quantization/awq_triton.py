@@ -4,6 +4,7 @@
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 
 AWQ_TRITON_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
 
@@ -227,6 +228,213 @@ def awq_gemm_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+@triton.jit
+def awq_gemv_kernel(
+    input_ptr,  # [K] fp16
+    qweight_ptr,  # [K, N//8] int32 packed
+    qzeros_ptr,  # [K//G, N//8] int32 packed
+    scales_ptr,  # [K//G, N] fp16
+    output_ptr,  # [N] fp16
+    K: tl.constexpr,
+    N: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Optimized N-split AWQ kernel WITHOUT masking.
+
+    Assumes BLOCK_N divides N evenly to eliminate exec mask manipulation.
+    This should generate much cleaner assembly.
+    """
+    pid = tl.program_id(0)
+    n_start = pid * BLOCK_N
+
+    N_packed = N // 8
+    num_groups = K // GROUP_SIZE
+
+    # Output column indices [BLOCK_N] - NO MASK needed
+    n_offs = n_start + tl.arange(0, BLOCK_N)
+
+    # Packed column indices
+    n_packed_offs = n_offs // 8
+    n_in_pack = n_offs % 8
+
+    # AWQ shift amounts
+    shifts = (n_in_pack // 2) * 4 + (n_in_pack % 2) * 16
+
+    # Accumulator tensor [BLOCK_N]
+    acc = tl.zeros([BLOCK_N], dtype=tl.float16)
+
+    for g in tl.range(num_groups, flatten=True):
+        # Load scales [BLOCK_N] - NO MASK
+        scale_ptrs = scales_ptr + g * N + n_offs
+        scales = tl.load(scale_ptrs).to(tl.float16)
+
+        # Load zeros [BLOCK_N//8] and unpack to [BLOCK_N] - NO MASK
+        qz_ptrs = qzeros_ptr + g * N_packed + n_packed_offs
+        qz = tl.load(qz_ptrs).to(tl.uint32)
+        zeros = ((qz >> shifts) & 0xF).to(tl.float16)
+
+        # Precompute bias
+        bias = -zeros * scales
+
+        # Inner loop over K in this group
+        for k in tl.range(g * GROUP_SIZE, (g + 1) * GROUP_SIZE):
+            # Load input scalar and broadcast
+            x = tl.load(input_ptr + k).to(tl.float16)
+
+            # Load weights - NO MASK
+            qw_ptrs = qweight_ptr + k * N_packed + n_packed_offs
+            qw = tl.load(qw_ptrs).to(tl.uint32)
+            w = ((qw >> shifts) & 0xF).to(tl.float16)
+
+            # Accumulate
+            acc += x * (w * scales + bias)
+
+    # Store results - NO MASK
+    tl.store(output_ptr + n_offs, acc.to(tl.float16))
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_N": 64, "SPLIT_K": 1}, num_warps=2),
+        triton.Config({"BLOCK_N": 64, "SPLIT_K": 2}, num_warps=2),
+        triton.Config({"BLOCK_N": 64, "SPLIT_K": 4}, num_warps=2),
+        triton.Config({"BLOCK_N": 64, "SPLIT_K": 8}, num_warps=2),
+        triton.Config({"BLOCK_N": 64, "SPLIT_K": 16}, num_warps=2),
+        triton.Config({"BLOCK_N": 128, "SPLIT_K": 1}, num_warps=2),
+        triton.Config({"BLOCK_N": 128, "SPLIT_K": 2}, num_warps=2),
+        triton.Config({"BLOCK_N": 128, "SPLIT_K": 4}, num_warps=2),
+        triton.Config({"BLOCK_N": 128, "SPLIT_K": 8}, num_warps=2),
+        triton.Config({"BLOCK_N": 128, "SPLIT_K": 16}, num_warps=2),
+        triton.Config({"BLOCK_N": 32, "SPLIT_K": 1}, num_warps=2),
+        triton.Config({"BLOCK_N": 32, "SPLIT_K": 2}, num_warps=2),
+        triton.Config({"BLOCK_N": 32, "SPLIT_K": 4}, num_warps=2),
+        triton.Config({"BLOCK_N": 32, "SPLIT_K": 8}, num_warps=2),
+        triton.Config({"BLOCK_N": 512, "SPLIT_K": 32}, num_warps=1),
+    ],
+    key=["K", "N"],
+)
+@triton.jit
+def awq_gemv_kernel_split_k(
+    input_ptr,  # [K] fp16
+    qweight_ptr,  # [K, N//8] int32 packed
+    qzeros_ptr,  # [K//G, N//8] int32 packed
+    scales_ptr,  # [K//G, N] fp16
+    output_ptr,  # [N] fp16 or [split_k, N] fp16 if split_k > 1
+    K: tl.constexpr,
+    N: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SPLIT_K: tl.constexpr = 1,
+):
+    """
+    Optimized N-split AWQ kernel WITHOUT masking, with optional split-K.
+
+    Assumes BLOCK_N divides N evenly to eliminate exec mask manipulation.
+
+    Split-K parallelization:
+    - SPLIT_K=1: Normal operation, each workgroup processes all K
+    - SPLIT_K>1: Each workgroup processes K/SPLIT_K elements, writes partial results
+    """
+    pid_n = tl.program_id(0)  # N dimension
+    pid_k = tl.program_id(1)  # K split dimension (0 if SPLIT_K=1)
+
+    n_start = pid_n * BLOCK_N
+
+    N_packed = N // 8
+    num_groups = K // GROUP_SIZE
+
+    # Output column indices [BLOCK_N] - NO MASK needed
+    n_offs = n_start + tl.arange(0, BLOCK_N)
+
+    # Packed column indices
+    n_packed_offs = n_offs // 8
+    n_in_pack = n_offs % 8
+
+    # AWQ shift amounts
+    shifts = (n_in_pack // 2) * 4 + (n_in_pack % 2) * 16
+
+    # Accumulator tensor [BLOCK_N]
+    acc = tl.zeros([BLOCK_N], dtype=tl.float16)
+
+    if SPLIT_K == 1:
+        # Fast path: no split-K, use static loops
+        for g in tl.range(num_groups, flatten=True):
+            # Load scales [BLOCK_N] - NO MASK
+            scale_ptrs = scales_ptr + g * N + n_offs
+            scales = tl.load(scale_ptrs).to(tl.float16)
+
+            # Load zeros [BLOCK_N//8] and unpack to [BLOCK_N] - NO MASK
+            qz_ptrs = qzeros_ptr + g * N_packed + n_packed_offs
+            qz = tl.load(qz_ptrs).to(tl.uint32)
+            zeros = ((qz >> shifts) & 0xF).to(tl.float16)
+
+            # Precompute bias
+            bias = -zeros * scales
+
+            # Inner loop over K in this group
+            for k in tl.range(g * GROUP_SIZE, (g + 1) * GROUP_SIZE):
+                # Load input scalar and broadcast
+                x = tl.load(input_ptr + k).to(tl.float16)
+
+                # Load weights - NO MASK
+                qw_ptrs = qweight_ptr + k * N_packed + n_packed_offs
+                qw = tl.load(qw_ptrs).to(tl.uint32)
+                w = ((qw >> shifts) & 0xF).to(tl.float16)
+
+                # Accumulate
+                acc += x * (w * scales + bias)
+    else:
+        # Split-K path: process subset of K
+        k_per_split = K // SPLIT_K
+        k_start = pid_k * k_per_split
+        k_end = k_start + k_per_split
+
+        # Group range for this split
+        g_start = k_start // GROUP_SIZE
+        g_end = (k_end + GROUP_SIZE - 1) // GROUP_SIZE  # Round up
+
+        for g in tl.range(g_start, g_end):
+            # Load scales [BLOCK_N] - NO MASK
+            scale_ptrs = scales_ptr + g * N + n_offs
+            scales = tl.load(scale_ptrs).to(tl.float16)
+
+            # Load zeros [BLOCK_N//8] and unpack to [BLOCK_N] - NO MASK
+            qz_ptrs = qzeros_ptr + g * N_packed + n_packed_offs
+            qz = tl.load(qz_ptrs).to(tl.uint32)
+            zeros = ((qz >> shifts) & 0xF).to(tl.float16)
+
+            # Precompute bias
+            bias = -zeros * scales
+
+            # K range for this group, clipped to our split's K range
+            k_group_start = tl.maximum(g * GROUP_SIZE, k_start)
+            k_group_end = tl.minimum((g + 1) * GROUP_SIZE, k_end)
+
+            # Inner loop over K in this group (within our split)
+            for k in range(k_group_start, k_group_end):
+                # Load input scalar and broadcast
+                x = tl.load(input_ptr + k).to(tl.float16)
+
+                # Load weights - NO MASK
+                qw_ptrs = qweight_ptr + k * N_packed + n_packed_offs
+                qw = tl.load(qw_ptrs).to(tl.uint32)
+                w = ((qw >> shifts) & 0xF).to(tl.float16)
+
+                # Accumulate
+                acc += x * (w * scales + bias)
+
+    # Store results - NO MASK
+    if SPLIT_K == 1:
+        # Direct write to output
+        tl.store(output_ptr + n_offs, acc.to(tl.float16))
+    else:
+        # Write partial results: output[pid_k, n_offs]
+        out_offs = pid_k * N + n_offs
+        tl.store(output_ptr + out_offs, acc.to(tl.float16))
+
+
 # qweights - [K     , M // 8], int32
 # scales   - [K // G, M     ], float16
 # zeros    - [K // G, M // 8], int32
@@ -284,7 +492,7 @@ def awq_dequantize_triton(
 # qzeros  - [K // G, N // 8]
 # scales  - [K // G, N]
 # split_k_iters - parallelism along K-dimension, int, power of 2.
-def awq_gemm_triton(
+def _awq_gemm_triton(
     input: torch.Tensor,
     qweight: torch.Tensor,
     scales: torch.Tensor,
@@ -307,6 +515,46 @@ def awq_gemm_triton(
     assert group_size <= K
     assert group_size in AWQ_TRITON_SUPPORTED_GROUP_SIZES or group_size == K
 
+    # if M == 1 and N % 512 == 0 and N == 19456:
+    # assert isinstance(M, int)
+
+    if M == 1 and N % 512 == 0:
+        result = torch.zeros((M, N), dtype=scales.dtype, device=input.device)
+        if N == 19456:
+            BLOCK_N = 128
+            gridA = lambda META: (triton.cdiv(N, META["BLOCK_N"]),)
+            # with profiler.record_function(f"awq_gemv {N}x{K}"):
+            if True:
+                awq_gemv_kernel[gridA](
+                    input,
+                    qweight,
+                    qzeros,
+                    scales,
+                    result,
+                    K=K,
+                    N=N,
+                    GROUP_SIZE=group_size,
+                    BLOCK_N=BLOCK_N,
+                    num_warps=2,
+                )
+            return result
+        else:
+            BLOCK_N = 64
+            gridA = lambda META: (triton.cdiv(N, META["BLOCK_N"]),)
+            # with profiler.record_function(f"awq_gemv_kernel_split_k {N}x{K}"):
+            if True:
+                awq_gemv_kernel_split_k[gridA](
+                    input,
+                    qweight,
+                    qzeros,
+                    scales,
+                    result,
+                    K=K,
+                    N=N,
+                    GROUP_SIZE=group_size,
+                )
+            return result
+
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         split_k_iters,
@@ -316,22 +564,43 @@ def awq_gemm_triton(
 
     # A = input, B = qweight, C = result
     # A = M x K, B = K x N, C = M x N
-    awq_gemm_kernel[grid](
-        input,
-        qweight,
-        result,
-        qzeros,
-        scales,
-        M,
-        N,
-        K,
-        group_size,
-        BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_N=block_size_n,
-        BLOCK_SIZE_K=block_size_k,
-        SPLIT_K=split_k_iters,
-    )
+    # with profiler.record_function(f"awq_gemm {M}x{N}x{K}"):
+    if True:
+        awq_gemm_kernel[grid](
+            input,
+            qweight,
+            result,
+            qzeros,
+            scales,
+            M,
+            N,
+            K,
+            group_size,
+            BLOCK_SIZE_M=block_size_m,
+            BLOCK_SIZE_N=block_size_n,
+            BLOCK_SIZE_K=block_size_k,
+            SPLIT_K=split_k_iters,
+        )
 
-    result = result.sum(0)
+        result = result.sum(0)
 
     return result
+
+
+def _awq_gemm_triton_fake(
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    split_k_iters: int,
+) -> torch.Tensor:
+    M, N = input.shape[0], qweight.shape[1] * 8
+    return torch.empty((M, N), dtype=scales.dtype, device=input.device)
+
+
+direct_register_custom_op(
+    op_name="awq_gemm_triton",
+    op_func=_awq_gemm_triton,
+    fake_impl=_awq_gemm_triton_fake,
+)
+awq_gemm_triton = torch.ops.vllm.awq_gemm_triton
