@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
+
 import torch
 
+import vllm.envs as envs
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -121,6 +124,7 @@ def awq_gemm_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    use_fp32_accumulator: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     pid_z = tl.program_id(1)
@@ -132,7 +136,7 @@ def awq_gemm_kernel(
     pid_m = pid // num_pid_n
     pid_n = pid % num_pid_n
 
-    accumulator_dtype = c_ptr.type.element_ty
+    accumulator_dtype = tl.float32 if use_fp32_accumulator else c_ptr.type.element_ty
 
     # NOTE: This doesn't work in TRITON_INTERPRET=1 mode.  Use below instead.
     # accumulator = tl.arange(0, BLOCK_SIZE_N)
@@ -239,6 +243,7 @@ def awq_gemv_kernel(
     N: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    use_fp32_accumulator: tl.constexpr,
 ):
     """
     Optimized N-split AWQ kernel WITHOUT masking.
@@ -262,8 +267,9 @@ def awq_gemv_kernel(
     # AWQ shift amounts
     shifts = (n_in_pack // 2) * 4 + (n_in_pack % 2) * 16
 
+    accumulator_dtype = tl.float32 if use_fp32_accumulator else tl.float16
     # Accumulator tensor [BLOCK_N]
-    acc = tl.zeros([BLOCK_N], dtype=tl.float16)
+    acc = tl.zeros([BLOCK_N], dtype=accumulator_dtype)
 
     for g in tl.range(num_groups, flatten=True):
         # Load scales [BLOCK_N] - NO MASK
@@ -272,11 +278,13 @@ def awq_gemv_kernel(
 
         # Load zeros [BLOCK_N//8] and unpack to [BLOCK_N] - NO MASK
         qz_ptrs = qzeros_ptr + g * N_packed + n_packed_offs
-        qz = tl.load(qz_ptrs).to(tl.uint32)
-        zeros = ((qz >> shifts) & 0xF).to(tl.float16)
+        qz = tl.load(qz_ptrs).to(tl.int32)
+        zeros = (qz >> shifts) & 0xF
 
         # Precompute bias
-        bias = -zeros * scales
+        # bias = -zeros * scales
+        # bias = -(zeros).to(tl.float16) * scales
+        # bias = -zeros.to(tl.float32) * scales.to(tl.float32)
 
         # Inner loop over K in this group
         for k in tl.range(g * GROUP_SIZE, (g + 1) * GROUP_SIZE):
@@ -286,35 +294,17 @@ def awq_gemv_kernel(
             # Load weights - NO MASK
             qw_ptrs = qweight_ptr + k * N_packed + n_packed_offs
             qw = tl.load(qw_ptrs).to(tl.uint32)
-            w = ((qw >> shifts) & 0xF).to(tl.float16)
+            w = (qw >> shifts) & 0xF
+            w2 = (w - zeros.to(tl.float16)) * scales
 
             # Accumulate
-            acc += x * (w * scales + bias)
+            acc += x * w2
+            # acc += x * (w * scales + bias)
 
     # Store results - NO MASK
-    tl.store(output_ptr + n_offs, acc.to(tl.float16))
+    tl.store(output_ptr + n_offs, acc.to(output_ptr.type.element_ty))
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": 64, "SPLIT_K": 1}, num_warps=2),
-        triton.Config({"BLOCK_N": 64, "SPLIT_K": 2}, num_warps=2),
-        triton.Config({"BLOCK_N": 64, "SPLIT_K": 4}, num_warps=2),
-        triton.Config({"BLOCK_N": 64, "SPLIT_K": 8}, num_warps=2),
-        triton.Config({"BLOCK_N": 64, "SPLIT_K": 16}, num_warps=2),
-        triton.Config({"BLOCK_N": 128, "SPLIT_K": 1}, num_warps=2),
-        triton.Config({"BLOCK_N": 128, "SPLIT_K": 2}, num_warps=2),
-        triton.Config({"BLOCK_N": 128, "SPLIT_K": 4}, num_warps=2),
-        triton.Config({"BLOCK_N": 128, "SPLIT_K": 8}, num_warps=2),
-        triton.Config({"BLOCK_N": 128, "SPLIT_K": 16}, num_warps=2),
-        triton.Config({"BLOCK_N": 32, "SPLIT_K": 1}, num_warps=2),
-        triton.Config({"BLOCK_N": 32, "SPLIT_K": 2}, num_warps=2),
-        triton.Config({"BLOCK_N": 32, "SPLIT_K": 4}, num_warps=2),
-        triton.Config({"BLOCK_N": 32, "SPLIT_K": 8}, num_warps=2),
-        triton.Config({"BLOCK_N": 512, "SPLIT_K": 32}, num_warps=1),
-    ],
-    key=["K", "N"],
-)
 @triton.jit
 def awq_gemv_kernel_split_k(
     input_ptr,  # [K] fp16
@@ -327,6 +317,7 @@ def awq_gemv_kernel_split_k(
     GROUP_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     SPLIT_K: tl.constexpr = 1,
+    use_fp32_accumulator: tl.constexpr = True,
 ):
     """
     Optimized N-split AWQ kernel WITHOUT masking, with optional split-K.
@@ -356,7 +347,8 @@ def awq_gemv_kernel_split_k(
     shifts = (n_in_pack // 2) * 4 + (n_in_pack % 2) * 16
 
     # Accumulator tensor [BLOCK_N]
-    acc = tl.zeros([BLOCK_N], dtype=tl.float16)
+    accumulator_dtype = tl.float32 if use_fp32_accumulator else tl.float16
+    acc = tl.zeros([BLOCK_N], dtype=accumulator_dtype)
 
     if SPLIT_K == 1:
         # Fast path: no split-K, use static loops
@@ -367,11 +359,8 @@ def awq_gemv_kernel_split_k(
 
             # Load zeros [BLOCK_N//8] and unpack to [BLOCK_N] - NO MASK
             qz_ptrs = qzeros_ptr + g * N_packed + n_packed_offs
-            qz = tl.load(qz_ptrs).to(tl.uint32)
-            zeros = ((qz >> shifts) & 0xF).to(tl.float16)
-
-            # Precompute bias
-            bias = -zeros * scales
+            qz = tl.load(qz_ptrs).to(tl.int32)
+            zeros = (qz >> shifts) & 0xF
 
             # Inner loop over K in this group
             for k in tl.range(g * GROUP_SIZE, (g + 1) * GROUP_SIZE):
@@ -381,19 +370,19 @@ def awq_gemv_kernel_split_k(
                 # Load weights - NO MASK
                 qw_ptrs = qweight_ptr + k * N_packed + n_packed_offs
                 qw = tl.load(qw_ptrs).to(tl.uint32)
-                w = ((qw >> shifts) & 0xF).to(tl.float16)
+                w = (qw >> shifts) & 0xF
+                w2 = (w - zeros.to(tl.float16)) * scales
 
                 # Accumulate
-                acc += x * (w * scales + bias)
+                acc += x * w2
     else:
-        # Split-K path: process subset of K
-        k_per_split = K // SPLIT_K
-        k_start = pid_k * k_per_split
-        k_end = k_start + k_per_split
+        # Split-K path: each split processes K/SPLIT_K elements
+        # k_per_split = K // SPLIT_K
+        # k_start = pid_k * k_per_split
 
-        # Group range for this split
-        g_start = k_start // GROUP_SIZE
-        g_end = (k_end + GROUP_SIZE - 1) // GROUP_SIZE  # Round up
+        groups_per_split = num_groups // SPLIT_K
+        g_start = pid_k * groups_per_split
+        g_end = g_start + groups_per_split
 
         for g in tl.range(g_start, g_end):
             # Load scales [BLOCK_N] - NO MASK
@@ -402,28 +391,22 @@ def awq_gemv_kernel_split_k(
 
             # Load zeros [BLOCK_N//8] and unpack to [BLOCK_N] - NO MASK
             qz_ptrs = qzeros_ptr + g * N_packed + n_packed_offs
-            qz = tl.load(qz_ptrs).to(tl.uint32)
-            zeros = ((qz >> shifts) & 0xF).to(tl.float16)
+            qz = tl.load(qz_ptrs).to(tl.int32)
+            zeros = (qz >> shifts) & 0xF
 
-            # Precompute bias
-            bias = -zeros * scales
-
-            # K range for this group, clipped to our split's K range
-            k_group_start = tl.maximum(g * GROUP_SIZE, k_start)
-            k_group_end = tl.minimum((g + 1) * GROUP_SIZE, k_end)
-
-            # Inner loop over K in this group (within our split)
-            for k in range(k_group_start, k_group_end):
+            # Inner loop over K in this group - clean loop, no conditionals
+            for k in tl.range(g * GROUP_SIZE, (g + 1) * GROUP_SIZE):
                 # Load input scalar and broadcast
                 x = tl.load(input_ptr + k).to(tl.float16)
 
                 # Load weights - NO MASK
                 qw_ptrs = qweight_ptr + k * N_packed + n_packed_offs
                 qw = tl.load(qw_ptrs).to(tl.uint32)
-                w = ((qw >> shifts) & 0xF).to(tl.float16)
+                w = (qw >> shifts) & 0xF
+                w2 = (w - zeros.to(tl.float16)) * scales
 
                 # Accumulate
-                acc += x * (w * scales + bias)
+                acc += x * w2
 
     # Store results - NO MASK
     if SPLIT_K == 1:
@@ -433,6 +416,157 @@ def awq_gemv_kernel_split_k(
         # Write partial results: output[pid_k, n_offs]
         out_offs = pid_k * N + n_offs
         tl.store(output_ptr + out_offs, acc.to(tl.float16))
+
+
+@triton.jit
+def awq_gemv_kernel_k_blocked(
+    input_ptr,  # [K] fp16
+    qweight_ptr,  # [K, N//8] int32 packed
+    qzeros_ptr,  # [K//G, N//8] int32 packed
+    scales_ptr,  # [K//G, N] fp16
+    output_ptr,  # [split_k, N] fp16
+    K: tl.constexpr,
+    N: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,  # Process BLOCK_K elements at once
+    SPLIT_K: tl.constexpr,
+    use_fp32_accumulator: tl.constexpr = True,
+):
+    """
+    K-blocked AWQ kernel for better instruction-level parallelism.
+
+    Processes BLOCK_K K-elements at a time to reduce loop overhead and
+    enable better pipelining of loads.
+    """
+    pid_n = tl.program_id(0)  # N dimension
+    pid_k = tl.program_id(1)  # K split dimension
+
+    n_start = pid_n * BLOCK_N
+    N_packed = N // 8
+
+    # Output column indices [BLOCK_N] - NO MASK needed
+    n_offs = n_start + tl.arange(0, BLOCK_N)
+
+    # Packed column indices
+    n_packed_offs = n_offs // 8
+    n_in_pack = n_offs % 8
+
+    # AWQ shift amounts
+    shifts = (n_in_pack // 2) * 4 + (n_in_pack % 2) * 16
+
+    # Accumulator tensor [BLOCK_N]
+    accumulator_dtype = tl.float32 if use_fp32_accumulator else tl.float16
+    acc = tl.zeros([BLOCK_N], dtype=accumulator_dtype)
+
+    # Calculate K range for this split
+    k_per_split = K // SPLIT_K
+    k_start = pid_k * k_per_split
+    # k_end = k_start + k_per_split
+
+    # Iterate over K in blocks of BLOCK_K
+    num_k_blocks = k_per_split // BLOCK_K
+
+    for kb in tl.range(num_k_blocks):
+        k_block_start = k_start + kb * BLOCK_K
+
+        # Which group does this block belong to?
+        g = k_block_start // GROUP_SIZE
+
+        # Load scales [BLOCK_N] - NO MASK
+        scale_ptrs = scales_ptr + g * N + n_offs
+        scales = tl.load(scale_ptrs).to(tl.float16)
+
+        # Load zeros and unpack to [BLOCK_N] - NO MASK
+        qz_ptrs = qzeros_ptr + g * N_packed + n_packed_offs
+        qz = tl.load(qz_ptrs).to(tl.int32)
+        zeros = ((qz >> shifts) & 0xF).to(tl.float16)
+
+        # Process BLOCK_K elements
+        for ki in tl.range(BLOCK_K):
+            k = k_block_start + ki
+
+            # Load input scalar
+            x = tl.load(input_ptr + k).to(tl.float16)
+
+            # Load weights - NO MASK
+            qw_ptrs = qweight_ptr + k * N_packed + n_packed_offs
+            qw = tl.load(qw_ptrs).to(tl.uint32)
+            w = (qw >> shifts) & 0xF
+            w2 = (w - zeros) * scales
+
+            # Accumulate
+            acc += x * w2
+
+    # Store partial results
+    out_offs = pid_k * N + n_offs
+    tl.store(output_ptr + out_offs, acc.to(tl.float16))
+
+
+def awq_gemv_k_blocked(
+    input,
+    qweight,
+    qzeros,
+    scales,
+    group_size,
+    use_fp32_accumulator,
+    num_warps=None,
+    split_k=None,
+    block_n=None,
+    block_k=None,
+):
+    """Wrapper for K-blocked kernel with automatic reduction."""
+    M, K = input.shape
+    N = qweight.shape[1] * 8
+
+    if block_n is None:
+        block_n = 256
+    if split_k is None:
+        split_k = 8
+    if num_warps is None:
+        num_warps = 2
+    if block_k is None:
+        # BLOCK_K must divide GROUP_SIZE evenly
+        block_k = min(32, group_size)
+
+    # Validate constraints
+    k_per_split = K // split_k
+    assert k_per_split % block_k == 0, (
+        f"k_per_split={k_per_split} must be divisible by block_k={block_k}"
+    )
+    assert block_k <= group_size, (
+        f"block_k={block_k} must be <= group_size={group_size}"
+    )
+    assert group_size % block_k == 0, (
+        f"group_size={group_size} must be divisible by block_k={block_k}"
+    )
+
+    partial_output = torch.zeros(split_k, N, dtype=torch.float16, device="cuda")
+
+    grid = (triton.cdiv(N, block_n), split_k)
+    awq_gemv_kernel_k_blocked[grid](
+        input,
+        qweight,
+        qzeros,
+        scales,
+        partial_output,
+        K=K,
+        N=N,
+        GROUP_SIZE=group_size,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        SPLIT_K=split_k,
+        use_fp32_accumulator=use_fp32_accumulator,
+        num_warps=num_warps,
+    )
+
+    # Reduce partial results
+    result = torch.zeros((M, N), dtype=scales.dtype, device=input.device)
+    reduce_split_k_kernel[(triton.cdiv(N, block_n),)](
+        partial_output, result, N=N, SPLIT_K=split_k, BLOCK_N=block_n, num_warps=1
+    )
+
+    return result
 
 
 # qweights - [K     , M // 8], int32
@@ -487,6 +621,203 @@ def awq_dequantize_triton(
     return result
 
 
+@triton.jit
+def reduce_split_k_kernel(
+    partial_ptr,  # [split_k, N] fp16
+    output_ptr,  # [N] fp16
+    N: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Reduce partial results from split-K parallelization.
+
+    Each workgroup reduces BLOCK_N columns across SPLIT_K partial results.
+    """
+    pid = tl.program_id(0)
+    n_start = pid * BLOCK_N
+    n_offs = n_start + tl.arange(0, BLOCK_N)
+
+    # Accumulate across splits
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for k_split in range(SPLIT_K):
+        partial_offs = k_split * N + n_offs
+        partial = tl.load(partial_ptr + partial_offs).to(tl.float32)
+        acc += partial
+
+    # Store final result
+    tl.store(output_ptr + n_offs, acc.to(tl.float16))
+
+
+def _get_valid_split_k_values(K: int, group_size: int) -> list:
+    """
+    Get all valid split_k values that:
+    1. Divide num_groups evenly (critical for clean inner loops without conditionals)
+    2. Ensure k_per_split is divisible by 32 for proper alignment
+    """
+    num_groups = K // group_size
+    valid_split_k = []
+    for sk in range(1, num_groups + 1):
+        if num_groups % sk == 0:
+            k_per_split = K // sk
+            if k_per_split % 32 == 0:
+                valid_split_k.append(sk)
+    return valid_split_k if valid_split_k else [1]
+
+
+def _choose_optimal_config(K: int, N: int, group_size: int) -> tuple:
+    """
+    Choose optimal (split_k, block_n, num_warps) based on shape.
+
+    Empirically tuned configurations (ROCm/AMD GPU MI300):
+    - K=512, N=4096:    block_n=64,  warps=2, split_k=2  -> 43.0 GB/s
+    - K=512, N=11008:   block_n=256, warps=8, split_k=2  -> 84.1 GB/s
+    - K=1536, N=4096:   block_n=256, warps=8, split_k=6  -> 85.0 GB/s
+    - K=2560, N=6144:   block_n=64,  warps=2, split_k=4  -> 99.8 GB/s
+    - K=2752, N=4096:   block_n=64,  warps=1, split_k=43 -> 91.5 GB/s (group_size=32)
+    - K=4096, N=2560:   block_n=64,  warps=2, split_k=8  -> 90.5 GB/s
+    - K=4096, N=4096:   block_n=64,  warps=1, split_k=16 -> 102.0 GB/s
+    - K=4096, N=11008:  block_n=256, warps=2, split_k=43 -> 103.5 GB/s
+    - K=4096, N=12288:  block_n=256, warps=8, split_k=2  -> 107.1 GB/s
+    - K=4096, N=22016:  block_n=256, warps=2, split_k=4  -> 125.4 GB/s
+    - K=9728, N=2560:   block_n=64,  warps=2, split_k=38 -> 100.2 GB/s
+    - K=11008, N=4096:  block_n=256, warps=2, split_k=43 -> 103.5 GB/s
+    - K=2560, N=19456:  block_n=256, warps=2, split_k=5  -> 107.3 GB/s
+    - K=9728, N=19456:  block_n=128, warps=1, split_k=19 -> 164.9 GB/s
+    """
+    valid_split_k = _get_valid_split_k_values(K, group_size)
+    num_groups = K // group_size
+
+    # Heuristics based on exhaustive search results
+    if num_groups <= 4:
+        # Very small K (e.g., K=512): use split_k=2
+        target_sk = 2
+        if N >= 8000:
+            block_n = 256
+            num_warps = 8
+        else:
+            block_n = 64
+            num_warps = 2
+    elif num_groups <= 15:
+        # Small K (e.g., K=1536): use ~50% of num_groups
+        target_sk = max(2, num_groups // 2)
+        block_n = 256
+        num_warps = 8
+    elif num_groups <= 25:
+        # Medium-small K (e.g., K=2560): prefer smaller split_k
+        target_sk = max(4, num_groups // 4)
+        if N >= 10000:
+            block_n = 256
+            num_warps = 2
+        else:
+            block_n = 64
+            num_warps = 2
+    elif num_groups <= 40:
+        # Medium K (e.g., K=4096, num_groups=32)
+        if N >= 20000:
+            # Very large N (e.g., N=22016): split_k=4, warps=2
+            target_sk = 4
+            block_n = 256
+            num_warps = 2
+        elif N >= 12000:
+            # Large N (e.g., N=12288): split_k=2, warps=8
+            target_sk = 2
+            block_n = 256
+            num_warps = 8
+        elif N >= 8000:
+            # Medium-large N (e.g., N=11008): split_k=8, warps=2
+            target_sk = 8
+            block_n = 64
+            num_warps = 2
+        elif N >= 4000:
+            # Medium N (e.g., N=4096): split_k=16, warps=1
+            target_sk = 16
+            block_n = 64
+            num_warps = 1
+        else:
+            # Small N: split_k=8, warps=2
+            target_sk = 8
+            block_n = 64
+            num_warps = 2
+    else:
+        # Large K (e.g., K=9728, K=11008)
+        if N >= 10000:
+            target_sk = 19
+            block_n = 128
+            num_warps = 1
+        else:
+            # Small N with large K
+            target_sk = min(43, num_groups // 2)
+            block_n = 256
+            num_warps = 2
+
+    # Special case: small group_size with many groups
+    if group_size <= 32 and num_groups > 40:
+        target_sk = num_groups // 2
+        block_n = 64
+        num_warps = 1
+
+    # Find the valid split_k closest to target
+    split_k = min(valid_split_k, key=lambda sk: abs(sk - target_sk))
+
+    return split_k, block_n, num_warps
+
+
+def awq_gemv_split_k(
+    input,
+    qweight,
+    qzeros,
+    scales,
+    group_size,
+    use_fp32_accumulator,
+    num_warps=None,
+    split_k=None,
+    block_n=None,
+):
+    M, K = input.shape
+    N = qweight.shape[1] * 8
+    result = torch.zeros((M, N), dtype=scales.dtype, device=input.device)
+
+    # Auto-select optimal configuration if not specified
+    if split_k is None or block_n is None or num_warps is None:
+        auto_split_k, auto_block_n, auto_num_warps = _choose_optimal_config(
+            K, N, group_size
+        )
+        if split_k is None:
+            split_k = auto_split_k
+        if block_n is None:
+            block_n = auto_block_n
+        if num_warps is None:
+            num_warps = auto_num_warps
+
+    partial_output = torch.zeros(split_k, N, dtype=torch.float16, device="cuda")
+
+    # Use the optimized split_k kernel with proper configuration
+    # The key optimization is choosing split_k that divides num_groups evenly
+    # to avoid conditionals in the inner loop
+    grid = (triton.cdiv(N, block_n), split_k)
+    awq_gemv_kernel_split_k[grid](
+        input,
+        qweight,
+        qzeros,
+        scales,
+        partial_output,
+        K=K,
+        N=N,
+        GROUP_SIZE=group_size,
+        BLOCK_N=block_n,
+        SPLIT_K=split_k,
+        use_fp32_accumulator=use_fp32_accumulator,
+        num_warps=num_warps,
+    )
+
+    reduce_split_k_kernel[(triton.cdiv(N, block_n),)](
+        partial_output, result, N=N, SPLIT_K=split_k, BLOCK_N=block_n, num_warps=1
+    )
+
+    return result
+
+
 # input   - [M, K]
 # qweight - [K, N // 8]
 # qzeros  - [K // G, N // 8]
@@ -518,42 +849,25 @@ def _awq_gemm_triton(
     # if M == 1 and N % 512 == 0 and N == 19456:
     # assert isinstance(M, int)
 
-    if M == 1 and N % 512 == 0:
-        result = torch.zeros((M, N), dtype=scales.dtype, device=input.device)
-        if N == 19456:
-            BLOCK_N = 128
-            gridA = lambda META: (triton.cdiv(N, META["BLOCK_N"]),)
-            # with profiler.record_function(f"awq_gemv {N}x{K}"):
-            if True:
-                awq_gemv_kernel[gridA](
-                    input,
-                    qweight,
-                    qzeros,
-                    scales,
-                    result,
-                    K=K,
-                    N=N,
-                    GROUP_SIZE=group_size,
-                    BLOCK_N=BLOCK_N,
-                    num_warps=2,
-                )
-            return result
-        else:
-            BLOCK_N = 64
-            gridA = lambda META: (triton.cdiv(N, META["BLOCK_N"]),)
-            # with profiler.record_function(f"awq_gemv_kernel_split_k {N}x{K}"):
-            if True:
-                awq_gemv_kernel_split_k[gridA](
-                    input,
-                    qweight,
-                    qzeros,
-                    scales,
-                    result,
-                    K=K,
-                    N=N,
-                    GROUP_SIZE=group_size,
-                )
-            return result
+    use_fp32_accumulator = False  # K > 2560
+
+    # Use GEMV kernel for M=1 if N is divisible by any reasonable BLOCK_N
+    # The kernel uses BLOCK_N of 64, 128, or 256, so N just needs to divide evenly
+    if envs.VLLM_USE_TRITON_AWQ_GEMV and M == 1 and N % 64 == 0:
+        # Use optimized split-k GEMV kernel for all shapes
+        # The split-k kernel with auto-tuned configuration is generally as good
+        # or better than the non-split-k kernel, even for large N like 19456
+        ctx = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else torch.profiler.record_function(
+                f"awq_gemv_split_k {N}x{K} gs={group_size}"
+            )
+        )
+        with ctx:
+            return awq_gemv_split_k(
+                input, qweight, qzeros, scales, group_size, use_fp32_accumulator
+            )
 
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
@@ -564,8 +878,14 @@ def _awq_gemm_triton(
 
     # A = input, B = qweight, C = result
     # A = M x K, B = K x N, C = M x N
-    # with profiler.record_function(f"awq_gemm {M}x{N}x{K}"):
-    if True:
+    ctx = (
+        nullcontext()
+        if torch.compiler.is_compiling()
+        else torch.profiler.record_function(f"awq_gemm {M}x{N}x{K}")
+    )
+    with ctx:
+        if M == 1:
+            block_size_m = 1
         awq_gemm_kernel[grid](
             input,
             qweight,
@@ -580,6 +900,7 @@ def _awq_gemm_triton(
             BLOCK_SIZE_N=block_size_n,
             BLOCK_SIZE_K=block_size_k,
             SPLIT_K=split_k_iters,
+            use_fp32_accumulator=use_fp32_accumulator,
         )
 
         result = result.sum(0)

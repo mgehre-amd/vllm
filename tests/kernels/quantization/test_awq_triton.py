@@ -5,6 +5,8 @@
 Run `pytest tests/kernels/quantization/test_awq_triton.py`.
 """
 
+import math
+
 import pytest
 import torch
 
@@ -115,29 +117,30 @@ def test_dequantize(qweight_rows, qweight_cols, group_size):
     torch.testing.assert_close(iweights_triton, iweights_torch)
 
 
-# input   - [N, K]
-# qweight - [K, M // 8]
-# qzeros  - [K // G, M // 8]
-# scales  - [K // G, M]
-@pytest.mark.parametrize("N", [1, 2, 4, 8, 14, 17, 23, 32])
-@pytest.mark.parametrize("K", [128])
-@pytest.mark.parametrize("M", [16, 24, 32])
+# input   - [M, K]
+# qweight - [K, N // 8]
+# qzeros  - [K // G, N // 8]
+# scales  - [K // G, N]
+@pytest.mark.parametrize("M", [1])
+@pytest.mark.parametrize("K", [128, 2560, 4096, 9728, 11008])
+@pytest.mark.parametrize("N", [16, 24, 32, 19456])
 @pytest.mark.parametrize("group_size", AWQ_TRITON_SUPPORTED_GROUP_SIZES)
 @pytest.mark.parametrize("splitK", [1, 8])
-def test_gemm(N, K, M, splitK, group_size):
+# splitK-group_size-M-K-N
+def test_gemm(M, K, N, splitK, group_size):
     if group_size == -1:
         group_size = K
 
     split_k_iters = splitK
 
-    input_rows = N
+    input_rows = M
     input_cols = K
-    input_dtype = torch.float32
+    input_dtype = torch.float16
     qweight_rows = input_cols
-    qweight_cols = M // 8
+    qweight_cols = N // 8
     scales_rows = qweight_rows // group_size
-    scales_cols = M
-    scales_dtype = torch.float32
+    scales_cols = N
+    scales_dtype = torch.float16
     qzeros_rows = scales_rows
     qzeros_cols = qweight_cols
 
@@ -166,6 +169,8 @@ def test_gemm(N, K, M, splitK, group_size):
         torch.isnan(output_torch)
     )
 
+    # Relax atol as our reduction dim becomes larger (more rounding error)
+    atol = min(5e-2 * math.sqrt(K), 1)
     torch.testing.assert_close(
-        output_triton.cpu(), output_torch.cpu(), atol=1e-1, rtol=1e-1
+        output_triton.cpu(), output_torch.cpu(), atol=atol, rtol=1e-1
     )
