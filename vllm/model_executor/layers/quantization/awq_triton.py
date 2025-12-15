@@ -698,6 +698,19 @@ def _choose_optimal_config(K: int, N: int, group_size: int) -> tuple:
         else:
             block_n = 64
             num_warps = 2
+    elif num_groups <= 7:
+        # Small K (e.g., K=896): maximize parallelism with split_k=num_groups
+        # For K=896 (num_groups=7): split_k=7 gives best results
+        target_sk = num_groups
+        if N >= 8000:
+            block_n = 256
+            num_warps = 2
+        elif N >= 1000:
+            block_n = 64
+            num_warps = 1
+        else:
+            block_n = 128
+            num_warps = 2
     elif num_groups <= 15:
         # Small K (e.g., K=1536): use ~50% of num_groups
         target_sk = max(2, num_groups // 2)
@@ -734,9 +747,15 @@ def _choose_optimal_config(K: int, N: int, group_size: int) -> tuple:
             target_sk = 16
             block_n = 64
             num_warps = 1
-        else:
-            # Small N: split_k=8, warps=2
+        elif N >= 2000:
+            # Small-medium N (e.g., N=2560): split_k=8, warps=2
             target_sk = 8
+            block_n = 64
+            num_warps = 2
+        else:
+            # Very small N (e.g., N=896): need high split_k for parallelism
+            # For K=4864, N=896 (num_groups=38): split_k=19, warps=2 works best
+            target_sk = num_groups // 2
             block_n = 64
             num_warps = 2
     else:
@@ -761,6 +780,39 @@ def _choose_optimal_config(K: int, N: int, group_size: int) -> tuple:
     split_k = min(valid_split_k, key=lambda sk: abs(sk - target_sk))
 
     return split_k, block_n, num_warps
+
+
+def awq_gemv_no_split_k(
+    input,
+    qweight,
+    qzeros,
+    scales,
+    group_size,
+    use_fp32_accumulator,
+    block_n=128,
+    num_warps=4,
+):
+    """Non-split-k GEMV kernel - faster for small K with large N."""
+    M, K = input.shape
+    N = qweight.shape[1] * 8
+    result = torch.zeros((M, N), dtype=scales.dtype, device=input.device)
+
+    grid = (triton.cdiv(N, block_n),)
+    awq_gemv_kernel[grid](
+        input,
+        qweight,
+        qzeros,
+        scales,
+        result,
+        K=K,
+        N=N,
+        GROUP_SIZE=group_size,
+        BLOCK_N=block_n,
+        use_fp32_accumulator=use_fp32_accumulator,
+        num_warps=num_warps,
+    )
+
+    return result
 
 
 def awq_gemv_split_k(
@@ -853,10 +905,36 @@ def _awq_gemm_triton(
 
     # Use GEMV kernel for M=1 if N is divisible by any reasonable BLOCK_N
     # The kernel uses BLOCK_N of 64, 128, or 256, so N just needs to divide evenly
-    if envs.VLLM_USE_TRITON_AWQ_GEMV and M == 1 and N % 64 == 0:
-        # Use optimized split-k GEMV kernel for all shapes
-        # The split-k kernel with auto-tuned configuration is generally as good
-        # or better than the non-split-k kernel, even for large N like 19456
+    # Exception: for very small shapes (K <= 1024 and N <= 2000), the generic gemm
+    # kernel is faster due to lower overhead
+    use_gemv = envs.VLLM_USE_TRITON_AWQ_GEMV and M == 1 and N % 64 == 0
+    if use_gemv and K <= 1024 and N <= 2000:
+        use_gemv = False  # Fall back to gemm for tiny shapes
+    if use_gemv:
+        # For K in [768, 1024] with very large N (e.g., 896x9728), non-split-k gemv
+        # is faster because split-k overhead exceeds its benefits with few groups,
+        # but N provides enough parallelism. This is a narrow sweet spot.
+        num_groups = K // group_size
+        if 6 <= num_groups <= 8 and N > 8000:
+            ctx = (
+                nullcontext()
+                if torch.compiler.is_compiling()
+                else torch.profiler.record_function(
+                    f"awq_gemv_no_split_k {N}x{K} gs={group_size}"
+                )
+            )
+            with ctx:
+                return awq_gemv_no_split_k(
+                    input,
+                    qweight,
+                    qzeros,
+                    scales,
+                    group_size,
+                    use_fp32_accumulator,
+                    block_n=128,
+                    num_warps=4,
+                )
+        # Use optimized split-k GEMV kernel for all other shapes
         ctx = (
             nullcontext()
             if torch.compiler.is_compiling()
@@ -884,7 +962,7 @@ def _awq_gemm_triton(
         else torch.profiler.record_function(f"awq_gemm {M}x{N}x{K}")
     )
     with ctx:
-        if M == 1:
+        if envs.VLLM_USE_TRITON_AWQ_GEMV and M == 1:
             block_size_m = 1
         awq_gemm_kernel[grid](
             input,
