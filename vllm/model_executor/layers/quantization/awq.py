@@ -7,6 +7,7 @@ import torch
 from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import (
@@ -264,10 +265,13 @@ class AWQLinearMethod(LinearMethodBase):
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
-        # num_tokens >= threshold
-        FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
+        # Enable unfused path only when explicitly allowed and batch is large
+        # enough to benefit from the heuristic.
+        allow_unfused_gemm = (
+            envs.VLLM_ALLOW_UNFUSED_AWQ_GEMM and x.shape[:-1].numel() >= 256
+        )
 
-        if FP16_MATMUL_HEURISTIC_CONDITION:
+        if allow_unfused_gemm:
             out = ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
             out = torch.matmul(reshaped_x, out)
         else:

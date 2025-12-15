@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     VLLM_TORCH_PROFILER_DUMP_CUDA_TIME_TOTAL: bool = True
     VLLM_USE_TRITON_AWQ: bool = False
     VLLM_USE_TRITON_AWQ_GEMV: bool = True
+    VLLM_ALLOW_UNFUSED_AWQ_GEMM: bool = True
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -914,6 +915,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # This is enabled by default for optimized single-token inference.
     "VLLM_USE_TRITON_AWQ_GEMV": lambda: bool(
         int(os.getenv("VLLM_USE_TRITON_AWQ_GEMV", "1"))
+    ),
+    # If set, enable the unfused AWQ GEMM path (dequant + torch.matmul).
+    "VLLM_ALLOW_UNFUSED_AWQ_GEMM": lambda: bool(
+        os.getenv("VLLM_ALLOW_UNFUSED_AWQ_GEMM", "1").lower() in ("true", "1")
     ),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (
