@@ -120,6 +120,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
+    VLLM_USE_TRITON_RESHAPE_AND_CACHE_FLASH: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
@@ -996,6 +997,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use AITER triton unified attention for V1 attention
     "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION", "False").lower()
+        in ("true", "1")
+    ),
+    # If set, use triton_reshape_and_cache_flash instead of ops.reshape_and_cache_flash
+    "VLLM_USE_TRITON_RESHAPE_AND_CACHE_FLASH": lambda: (
+        os.getenv("VLLM_USE_TRITON_RESHAPE_AND_CACHE_FLASH", "False").lower()
         in ("true", "1")
     ),
     # Whether to use aiter fusion shared experts ops.

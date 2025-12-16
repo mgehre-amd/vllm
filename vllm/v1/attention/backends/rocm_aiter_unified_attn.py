@@ -5,6 +5,7 @@
 import torch
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.attention.backends.abstract import AttentionType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -152,16 +153,32 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         ):
             # Reshape the input keys and values and store them in the cache.
             # Skip this if sharing KV cache with an earlier attention layer.
-            ops.reshape_and_cache_flash(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                attn_metadata.slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
-            )
+            if envs.VLLM_USE_TRITON_RESHAPE_AND_CACHE_FLASH:
+                from vllm.attention.ops.triton_reshape_and_cache_flash import (
+                    triton_reshape_and_cache_flash,
+                )
+
+                triton_reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
+            else:
+                ops.reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
 
         if self.kv_cache_dtype.startswith("fp8"):
             key_cache = key_cache.view(self.fp8_dtype)
