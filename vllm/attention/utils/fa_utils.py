@@ -18,7 +18,15 @@ elif current_platform.is_xpu():
     flash_attn_varlen_func = ops.flash_attn_varlen_func
     get_scheduler_metadata = ops.get_scheduler_metadata
 elif current_platform.is_rocm():
-    pass
+    try:
+        from flash_attn import flash_attn_varlen_func  # noqa: F401
+    except ImportError:
+
+        def flash_attn_varlen_func(*args, **kwargs):
+            raise ImportError(
+                "ROCm platform requires upstream flash-attn "
+                "to be installed. Please install flash-attn first."
+            )
 
 
 def get_flash_attn_version(requires_alibi: bool = False) -> int | None:
