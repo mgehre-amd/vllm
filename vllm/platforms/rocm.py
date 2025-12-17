@@ -313,20 +313,7 @@ class RocmPlatform(Platform):
                 logger.info("Using Aiter Flash Attention backend on V1 engine.")
                 return AttentionBackendEnum.ROCM_AITER_FA.get_path()
 
-            # Priority 5: Default to AITER backends when aiter package is installed
-            # - gfx9: Use ROCM_AITER_FA for best performance
-            # - non-gfx9: Use ROCM_AITER_UNIFIED_ATTN
-            from importlib.util import find_spec
-
-            if find_spec("aiter") is not None:
-                if on_gfx9():
-                    logger.info("Using Aiter Flash Attention backend on V1 engine.")
-                    return AttentionBackendEnum.ROCM_AITER_FA.get_path()
-                else:
-                    logger.info("Using Aiter Unified Attention backend on V1 engine.")
-                    return AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN.get_path()
-
-            # Default: Triton Unified Attention (when aiter is not installed)
+            # Default: Triton Unified Attention
             logger.info("Using Triton Attention backend on V1 engine.")
             return AttentionBackendEnum.TRITON_ATTN.get_path()
 
