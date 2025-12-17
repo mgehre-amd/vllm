@@ -14,6 +14,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.platform_utils import get_cu_count
 
 logger = init_logger(__name__)
 float8_info = torch.finfo(current_platform.fp8_dtype())
@@ -68,7 +69,7 @@ def select_2d_config(
 
 def select_3d_config(head_size, block_size, max_seqlen_k, num_2d_prgms, element_size):
     if current_platform.is_rocm():
-        cu_count = current_platform.get_cu_count()
+        cu_count = get_cu_count()
         if head_size < 128 or element_size == 1:
             cu_mult = 4
             MIN_SEGMENTS = 8
@@ -124,7 +125,7 @@ def use_2d_kernel(
     element_size,
 ):
     if current_platform.is_rocm():
-        cu_count = current_platform.get_cu_count()
+        cu_count = get_cu_count()
         cu_mult = 4 if head_size < 128 or element_size == 1 else 2
         target_num_prgms = cu_count * cu_mult
         return (
