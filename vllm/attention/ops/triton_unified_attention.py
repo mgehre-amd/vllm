@@ -40,12 +40,16 @@ def select_2d_config(
         max_num_stages_2d = 4
         if head_size > 128:
             max_num_stages_2d = 2
+
         if not all_decode:
             num_stages_2d = 1
             num_warps = 2
         else:
             num_stages_2d = 3
             num_warps = 2
+
+        if current_platform.is_navi():
+            TILE_SIZE = block_size
 
         if max_seqlen_q >= 256:
             BLOCK_M = 128
@@ -78,8 +82,15 @@ def select_3d_config(head_size, block_size, max_seqlen_k, num_2d_prgms, element_
             cu_mult = 2
             MIN_SEGMENTS = 4
             attn_warps = 2
+
         target_num_prgms = cu_count * cu_mult
-        TILE_SIZE = 64
+        if current_platform.is_navi():
+            # Use TILE_SIZE = block_size for fast path (avoids div/mod operations)
+            TILE_SIZE = block_size
+            MIN_SEGMENTS = 16 if TILE_SIZE <= 16 else 8
+        else:
+            TILE_SIZE = 64
+
         reduce_num_warps = 2
 
         num_segments = math.ceil(target_num_prgms / num_2d_prgms)
@@ -127,6 +138,8 @@ def use_2d_kernel(
     if current_platform.is_rocm():
         cu_count = get_cu_count()
         cu_mult = 4 if head_size < 128 or element_size == 1 else 2
+        if current_platform.is_navi():
+            cu_mult = 4
         target_num_prgms = cu_count * cu_mult
         return (
             (sliding_window > 0)
@@ -365,35 +378,58 @@ def kernel_unified_attention_2d(
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
     # iterate through tiles (now limited to the sliding window range)
     for j in range(tile_start, tile_end):
-        seq_offset = j * TILE_SIZE + offs_t
-        # to reduce the masking effect when not needed
+        # Fast path when TILE_SIZE == BLOCK_SIZE: avoid div/mod operations
         if TILE_SIZE == BLOCK_SIZE:
-            tile_mask = tl.full((1,), 1, dtype=tl.int1)
+            physical_block_idx = tl.load(block_tables_ptr + block_table_offset + j).to(
+                tl.int64
+            )
+
+            v_offset = (
+                physical_block_idx * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + offs_t[:, None] * stride_v_cache_1
+            )
+
+            k_offset = (
+                physical_block_idx * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + offs_t[None, :] * stride_k_cache_1
+            )
+
+            K_load_mask = dim_mask[:, None]
+            V_load_mask = dim_mask[None, :]
+            seq_offset = j * BLOCK_SIZE + offs_t
         else:
+            seq_offset = j * TILE_SIZE + offs_t
             tile_mask = seq_offset < max_seq_prefix_len
 
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
+            physical_block_idx = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            ).to(tl.int64)
 
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
 
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
+
+            K_load_mask = dim_mask[:, None] & tile_mask[None, :]
+            V_load_mask = dim_mask[None, :] & tile_mask[:, None]
 
         # K : (HEAD_SIZE, TILE_SIZE)
         K_load = tl.load(
             key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
+            mask=K_load_mask,
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
@@ -409,7 +445,7 @@ def kernel_unified_attention_2d(
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
             value_cache_ptr + v_offset,
-            mask=dim_mask[None, :] & tile_mask[:, None],
+            mask=V_load_mask,
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
@@ -680,34 +716,58 @@ def kernel_unified_attention_3d(
         segm_idx * tiles_per_segment,
         min((segm_idx + 1) * tiles_per_segment, num_tiles),
     ):
-        seq_offset = j * TILE_SIZE + offs_t
+        # Fast path when TILE_SIZE == BLOCK_SIZE: avoid div/mod operations
         if TILE_SIZE == BLOCK_SIZE:
-            tile_mask = tl.full((1,), 1, dtype=tl.int1)
+            physical_block_idx = tl.load(block_tables_ptr + block_table_offset + j).to(
+                tl.int64
+            )
+
+            v_offset = (
+                physical_block_idx * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + offs_t[:, None] * stride_v_cache_1
+            )
+
+            k_offset = (
+                physical_block_idx * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + offs_t[None, :] * stride_k_cache_1
+            )
+
+            K_load_mask = dim_mask[:, None]
+            V_load_mask = dim_mask[None, :]
+            seq_offset = j * BLOCK_SIZE + offs_t
         else:
+            seq_offset = j * TILE_SIZE + offs_t
             tile_mask = seq_offset < max_seq_prefix_len
 
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
+            physical_block_idx = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            ).to(tl.int64)
 
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
 
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
+
+            K_load_mask = dim_mask[:, None] & tile_mask[None, :]
+            V_load_mask = dim_mask[None, :] & tile_mask[:, None]
 
         # K : (HEAD_SIZE, TILE_SIZE)
         K_load = tl.load(
             key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
+            mask=K_load_mask,
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
@@ -723,7 +783,7 @@ def kernel_unified_attention_3d(
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
             value_cache_ptr + v_offset,
-            mask=dim_mask[None, :] & tile_mask[:, None],
+            mask=V_load_mask,
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
