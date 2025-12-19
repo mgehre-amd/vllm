@@ -4,6 +4,7 @@
 from contextlib import nullcontext
 
 import torch
+import torch._dynamo
 
 import vllm.envs as envs
 from vllm.triton_utils import tl, triton
@@ -119,12 +120,13 @@ def awq_gemm_kernel(
     M,
     N,
     K,
-    group_size,
+    group_size: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
-    use_fp32_accumulator: tl.constexpr,
+    NUM_K_TILES: tl.constexpr,
+    K_GROUPS: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     pid_z = tl.program_id(1)
@@ -136,14 +138,9 @@ def awq_gemm_kernel(
     pid_m = pid // num_pid_n
     pid_n = pid % num_pid_n
 
-    accumulator_dtype = tl.float32 if use_fp32_accumulator else c_ptr.type.element_ty
+    accumulator_dtype = c_ptr.type.element_ty
 
     # NOTE: This doesn't work in TRITON_INTERPRET=1 mode.  Use below instead.
-    # accumulator = tl.arange(0, BLOCK_SIZE_N)
-    # accumulator = tl.broadcast_to(accumulator[None, :],
-    # (BLOCK_SIZE_M, BLOCK_SIZE_N))
-    # accumulator = accumulator & 0x0
-    # accumulator = accumulator.to(accumulator_dtype)
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=accumulator_dtype)
 
     # Create reverse AWQ order as tensor: [0, 4, 1, 5, 2, 6, 3, 7]
@@ -177,10 +174,7 @@ def awq_gemm_kernel(
     a_ptrs = a_ptr + offsets_a
     b_ptrs = b_ptr + offsets_b
 
-    # NOTE: Use this in TRITON_INTERPRET=1 mode instead of tl.cdiv
-    # block_offset = BLOCK_SIZE_K * SPLIT_K
-    # for k in range(0, (K + block_offset - 1) // (block_offset)):
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)):
+    for k in tl.static_range(NUM_K_TILES):
         masks_k = offsets_k < K
         masks_a = masks_am[:, None] & masks_k[None, :]
         a = tl.load(a_ptrs, mask=masks_a, other=0.0)
@@ -196,7 +190,7 @@ def awq_gemm_kernel(
             BLOCK_SIZE_K * SPLIT_K * k + pid_z * BLOCK_SIZE_K
         ) // group_size + tl.arange(0, 1)
         offsets_z = (N // 8) * offsets_szk[:, None] + offsets_zn[None, :]
-        masks_zk = offsets_szk < K // group_size
+        masks_zk = offsets_szk < K_GROUPS
         masks_z = masks_zk[:, None] & masks_zn[None, :]
         zeros_ptrs = zeros_ptr + offsets_z
         zeros = tl.load(zeros_ptrs, mask=masks_z, other=0.0)
@@ -206,7 +200,7 @@ def awq_gemm_kernel(
         zeros = tl.broadcast_to(zeros, (BLOCK_SIZE_K, BLOCK_SIZE_N))
 
         offsets_s = N * offsets_szk[:, None] + offsets_sn[None, :]
-        masks_sk = offsets_szk < K // group_size
+        masks_sk = offsets_szk < K_GROUPS
         masks_s = masks_sk[:, None] & masks_sn[None, :]
         scales_ptrs = scales_ptr + offsets_s
         scales = tl.load(scales_ptrs, mask=masks_s, other=0.0)
@@ -576,7 +570,7 @@ def awq_dequantize_triton(
     qweight: torch.Tensor,
     scales: torch.Tensor,
     zeros: torch.Tensor,
-    block_size_x: int = 32,
+    block_size_x: int = 128,
     block_size_y: int = 32,
 ) -> torch.Tensor:
     K = qweight.shape[0]
@@ -606,6 +600,12 @@ def awq_dequantize_triton(
         triton.cdiv(X, META["BLOCK_SIZE_X"]),
         triton.cdiv(Y, META["BLOCK_SIZE_Y"]),
     )
+
+    # print(f"qweight shape:",qweight.shape)
+    # print(f"scale shape:",scales.shape)
+    # print(f"zeros shape:",zeros.shape)
+    # print(f"grid shape:{grid}")
+
     awq_dequantize_kernel[grid](
         qweight,
         scales,
@@ -881,9 +881,9 @@ def _awq_gemm_triton(
     scales: torch.Tensor,
     qzeros: torch.Tensor,
     split_k_iters: int,
-    block_size_m: int = 32,
-    block_size_n: int = 32,
-    block_size_k: int = 32,
+    block_size_m: int = 16,
+    block_size_n: int = 64,
+    block_size_k: int = 64,
 ) -> torch.Tensor:
     M, K = input.shape
     N = qweight.shape[1] * 8
@@ -953,7 +953,6 @@ def _awq_gemm_triton(
     )
 
     result = torch.zeros((split_k_iters, M, N), dtype=scales.dtype, device=input.device)
-
     # A = input, B = qweight, C = result
     # A = M x K, B = K x N, C = M x N
     ctx = (
@@ -961,6 +960,11 @@ def _awq_gemm_triton(
         if torch.compiler.is_compiling()
         else torch.profiler.record_function(f"awq_gemm {M}x{N}x{K}")
     )
+    num_k_tiles = (K + block_size_k * split_k_iters - 1) // (
+        block_size_k * split_k_iters
+    )
+    k_group = K // group_size
+
     with ctx:
         if envs.VLLM_USE_TRITON_AWQ_GEMV and M == 1:
             block_size_m = 1
@@ -978,7 +982,10 @@ def _awq_gemm_triton(
             BLOCK_SIZE_N=block_size_n,
             BLOCK_SIZE_K=block_size_k,
             SPLIT_K=split_k_iters,
-            use_fp32_accumulator=use_fp32_accumulator,
+            NUM_K_TILES=num_k_tiles,
+            K_GROUPS=k_group,
+            num_stages=1,
+            num_warps=4,
         )
 
         result = result.sum(0)
