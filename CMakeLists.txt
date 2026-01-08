@@ -917,6 +917,7 @@ if (VLLM_GPU_LANG STREQUAL "HIP")
   # Add QuickReduce kernels
   list(APPEND VLLM_EXT_SRC
     "csrc/custom_quickreduce.cu"
+    "csrc/quantization/awq/awq_gemv_hip.cu"
   )
 # if ROCM endif
 endif()

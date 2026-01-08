@@ -375,6 +375,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
 #endif
 
+#ifdef USE_ROCM
+  // AWQ GEMV for ROCm (optimized for RDNA3/3.5)
+  ops.def(
+      "awq_gemv_hip(Tensor activation, Tensor qweight, Tensor scales, "
+      "Tensor qzeros) -> Tensor");
+  ops.impl("awq_gemv_hip", torch::kCUDA, &awq_gemv_hip);
+#endif
+
   // Dequantization for GGML.
   ops.def(
       "ggml_dequantize(Tensor W, int type, SymInt m, SymInt n, ScalarType? "

@@ -199,6 +199,11 @@ torch::Tensor awq_dequantize(torch::Tensor _kernel,
 torch::Tensor permute_cols(torch::Tensor const& A, torch::Tensor const& perm);
 #endif
 
+#ifdef USE_ROCM
+torch::Tensor awq_gemv_hip(torch::Tensor activation, torch::Tensor qweight,
+                           torch::Tensor scales, torch::Tensor qzeros);
+#endif
+
 torch::Tensor ggml_dequantize(torch::Tensor W, int64_t type, int64_t m,
                               int64_t n,
                               std::optional<at::ScalarType> const& dtype);

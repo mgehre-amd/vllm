@@ -508,13 +508,52 @@ def _awq_gemm(
 
     if FP16_MATMUL_HEURISTIC_CONDITION:
         out = awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
+        # Handle padded weights: slice to match input K dimension
+        K = input.shape[-1]
+        if out.shape[0] > K:
+            out = out[:K, :].contiguous()  # rocBLAS requires contiguous
         return torch.matmul(input, out)
 
     if envs.VLLM_USE_TRITON_AWQ:
         from vllm.model_executor.layers.quantization.awq_triton import awq_gemm_triton
 
         return awq_gemm_triton(input, qweight, scales, qzeros, split_k_iters)
+
+    # Handle padded weights for native kernel: pad input to match
+    K = input.shape[-1]
+    weight_K = qweight.shape[0]
+    if weight_K > K:
+        input_padded = torch.zeros(
+            (*input.shape[:-1], weight_K), dtype=input.dtype, device=input.device
+        )
+        input_padded[..., :K] = input
+        input = input_padded
     return torch.ops._C.awq_gemm(input, qweight, scales, qzeros, split_k_iters)
+
+
+def awq_gemv_hip(
+    activation: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+) -> torch.Tensor:
+    """AWQ GEMV kernel optimized for ROCm/HIP (RDNA3/3.5).
+
+    Only supports:
+    - M=1 (single token)
+    - K=4096, group_size=128 (32 groups)
+    - N divisible by 8
+
+    Args:
+        activation: [K] or [1, K] half tensor
+        qweight: [K, N/8] int32 tensor (8 int4 values per uint32)
+        scales: [K/G, N] half tensor
+        qzeros: [K/G, N/8] int32 tensor
+
+    Returns:
+        output: [N] half tensor
+    """
+    return torch.ops._C.awq_gemv_hip(activation, qweight, scales, qzeros)
 
 
 def _awq_gemm_fake_impl(

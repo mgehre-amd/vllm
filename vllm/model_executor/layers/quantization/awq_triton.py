@@ -887,16 +887,13 @@ def _awq_gemm_triton(
 ) -> torch.Tensor:
     M, K = input.shape
     N = qweight.shape[1] * 8
-    group_size = qweight.shape[0] // qzeros.shape[0]
+    weight_K = qweight.shape[0]  # May be > K if weights were padded
+    group_size = weight_K // qzeros.shape[0]
 
     assert N > 0 and K > 0 and M > 0
-    assert qweight.shape[0] == K and qweight.shape[1] == N // 8
-    assert qzeros.shape[0] == K // group_size and qzeros.shape[1] == N // 8
-    assert scales.shape[0] == K // group_size and scales.shape[1] == N
     assert split_k_iters & (split_k_iters - 1) == 0 and split_k_iters != 0
     assert split_k_iters <= 32
-    assert group_size <= K
-    assert group_size in AWQ_TRITON_SUPPORTED_GROUP_SIZES or group_size == K
+    assert group_size in AWQ_TRITON_SUPPORTED_GROUP_SIZES or group_size == weight_K
 
     # if M == 1 and N % 512 == 0 and N == 19456:
     # assert isinstance(M, int)
@@ -910,6 +907,64 @@ def _awq_gemm_triton(
     use_gemv = envs.VLLM_USE_TRITON_AWQ_GEMV and M == 1 and N % 64 == 0
     if use_gemv and K <= 1024 and N <= 2000:
         use_gemv = False  # Fall back to gemm for tiny shapes
+
+    # Try HIP-optimized GEMV kernel on ROCm
+    # Supports: M=1, group_size=128, any K divisible by group_size
+    # Uses K-padding to enable higher split-k factors for better parallelism
+    # Skip for small N (<1500) where Triton's parallelization is more efficient
+    if (
+        use_gemv
+        and group_size == 128
+        and N % 8 == 0
+        and K % group_size == 0
+        and N >= 1500
+    ):
+        from vllm.platforms import current_platform
+
+        if current_platform.is_rocm():
+            try:
+                from vllm._custom_ops import awq_gemv_hip
+
+                # Check if weights are padded (qweight.K > activation.K)
+                padded_K = qweight.shape[0]
+                act = input.squeeze(0)
+
+                if padded_K > K:
+                    # Weights were padded during preprocessing - pad activation
+                    act_padded = torch.zeros(
+                        padded_K, dtype=act.dtype, device=act.device
+                    )
+                    act_padded[:K] = act
+                    act = act_padded
+
+                ctx = (
+                    nullcontext()
+                    if torch.compiler.is_compiling()
+                    else torch.profiler.record_function(
+                        f"awq_gemv_hip {N}x{padded_K} gs={group_size}"
+                    )
+                )
+                with ctx:
+                    return awq_gemv_hip(act, qweight, scales, qzeros).unsqueeze(0)
+            except (RuntimeError, AttributeError):
+                # Fall through to Triton kernels if HIP kernel not available
+                pass
+
+    # Pad activation if weights were padded during preprocessing
+    if weight_K > K:
+        input_padded = torch.zeros(
+            (M, weight_K), dtype=input.dtype, device=input.device
+        )
+        input_padded[:, :K] = input
+        input = input_padded
+        K = weight_K  # Update K to match padded weights
+
+    # Validate tensor dimensions
+    assert qweight.shape[1] == N // 8
+    assert qzeros.shape[0] == K // group_size and qzeros.shape[1] == N // 8
+    assert scales.shape[0] == K // group_size and scales.shape[1] == N
+    assert group_size <= K
+
     if use_gemv:
         # For K in [768, 1024] with very large N (e.g., 896x9728), non-split-k gemv
         # is faster because split-k overhead exceeds its benefits with few groups,
