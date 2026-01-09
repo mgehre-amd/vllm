@@ -29,6 +29,60 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def compute_awq_padding_for_rocm(
+    num_groups: int, N: int, group_size: int = 128
+) -> tuple[bool, int]:
+    """Compute optimal K-padding for AWQ weights on ROCm.
+
+    The HIP GEMV kernel uses split-k parallelization that requires num_groups
+    to be divisible by specific factors for best performance. For small N,
+    higher split-k values are needed to provide enough parallelism.
+
+    Args:
+        num_groups: Number of quantization groups (K // group_size)
+        N: Output dimension
+        group_size: Quantization group size (must be 128)
+
+    Returns:
+        Tuple of (should_pad, padded_groups) where:
+        - should_pad: True if padding is beneficial
+        - padded_groups: Target number of groups after padding
+    """
+    if group_size != 128:
+        return False, num_groups
+
+    # Maximum padding overhead allowed (as fraction of original size)
+    MAX_PADDING_OVERHEAD = 0.15  # 15%
+
+    # Determine which split-k values to try based on N
+    # For smaller N, we need higher split-k for more K-parallelism
+    # Always include 2 as a final fallback
+    if N <= 4096:
+        split_k_targets = [16, 8, 4, 2]
+    elif N <= 8192:
+        split_k_targets = [8, 4, 2]
+    elif N <= 12288:
+        split_k_targets = [4, 2]
+    else:
+        # Large N has enough parallelism, no padding needed
+        return False, num_groups
+
+    # Try each split-k target in order, stopping at the first one
+    # that either already works or can be achieved with acceptable overhead
+    for split_k in split_k_targets:
+        if num_groups % split_k == 0:
+            # Already divisible, no padding needed for this split-k
+            return False, num_groups
+
+        # Calculate padding needed
+        padded = ((num_groups + split_k - 1) // split_k) * split_k
+        overhead = (padded - num_groups) / num_groups
+        if overhead <= MAX_PADDING_OVERHEAD:
+            return True, padded
+
+    return False, num_groups
+
+
 class AWQConfig(QuantizationConfig):
     """Config class for AWQ.
 
@@ -263,30 +317,9 @@ class AWQLinearMethod(LinearMethodBase):
             N = qweight.shape[1] * 8  # Unpack factor
             num_groups = qzeros.shape[0]
 
-            # Determine optimal padding based on output size (N)
-            # These thresholds match the kernel dispatch logic in awq_gemv_hip.cu
-            can_use_splitk_16 = num_groups % 16 == 0
-            can_use_splitk_8 = num_groups % 8 == 0
-            can_use_splitk_4 = num_groups % 4 == 0
-
-            should_pad = False
-            padded_groups = num_groups
-
-            # For small N, we need higher split-k for more K-parallelism
-            # Pad aggressively to enable the optimal split-k for each N range
-            if N <= 4096:
-                # For very small N: pad to enable split-k=16
-                if not can_use_splitk_16:
-                    padded_groups = ((num_groups + 15) // 16) * 16
-                    should_pad = True
-            elif N <= 8192:
-                # For small N: pad to enable split-k=8
-                if not can_use_splitk_8:
-                    padded_groups = ((num_groups + 7) // 8) * 8
-                    should_pad = True
-            elif N <= 12288 and not can_use_splitk_4:
-                padded_groups = ((num_groups + 3) // 4) * 4
-                should_pad = True
+            should_pad, padded_groups = compute_awq_padding_for_rocm(
+                num_groups, N, group_size
+            )
 
             if should_pad and padded_groups > num_groups:
                 pad_groups = padded_groups - num_groups
