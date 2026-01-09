@@ -21,10 +21,11 @@
 
 // ============================================================================
 // AWQ GEMV Kernel with Split-K parallelism
-// Accumulates in fp32 for precision, supports SPLIT_K = 1, 2, 4, 8
+// Accumulates in fp32 for precision, supports SPLIT_K = 1, 2, 4, 8, 16
 // ============================================================================
 template <int OUTPUT_PER_THREAD, int SPLIT_K>
-__global__ __launch_bounds__(256) void awq_gemv_kernel_splitk(
+__global__
+__launch_bounds__(SPLIT_K <= 8 ? 256 : 512) void awq_gemv_kernel_splitk(
     const __half* __restrict__ activation,  // [K]
     const uint32_t* __restrict__ qweight,   // [K, N/8]
     const __half* __restrict__ scales,      // [K/G, N]
@@ -33,8 +34,9 @@ __global__ __launch_bounds__(256) void awq_gemv_kernel_splitk(
     size_t M, size_t K, size_t N, size_t G) {
   static_assert(OUTPUT_PER_THREAD == 8,
                 "Split-K only supports OUTPUT_PER_THREAD=8");
-  static_assert(SPLIT_K == 1 || SPLIT_K == 2 || SPLIT_K == 4 || SPLIT_K == 8,
-                "SPLIT_K must be 1, 2, 4, or 8");
+  static_assert(SPLIT_K == 1 || SPLIT_K == 2 || SPLIT_K == 4 || SPLIT_K == 8 ||
+                    SPLIT_K == 16,
+                "SPLIT_K must be 1, 2, 4, 8, or 16");
 
   // Thread organization: SPLIT_K splits of 32 threads each
   // SPLIT_K=2: 64 threads/block, SPLIT_K=4: 128 threads/block, SPLIT_K=8: 256
@@ -310,6 +312,22 @@ __global__ __launch_bounds__(256) void awq_gemv_kernel_splitk(
   // For SPLIT_K=2: one reduction step
   // For SPLIT_K=4: two reduction steps
   // For SPLIT_K=8: three reduction steps
+  // For SPLIT_K=16: four reduction steps
+  if constexpr (SPLIT_K >= 16) {
+    // Step 0: splits 0-7 add splits 8-15
+    if (split_id < 8) {
+      float* other_smem =
+          &smem_f[(split_id + 8) * THREADS_PER_SPLIT * OUTPUT_PER_THREAD +
+                  thread_in_split * OUTPUT_PER_THREAD];
+  #pragma unroll
+      for (int i = 0; i < OUTPUT_PER_THREAD; i++) {
+        acc[i] = my_smem[i] + other_smem[i];
+        my_smem[i] = acc[i];
+      }
+    }
+    __syncthreads();
+  }
+
   if constexpr (SPLIT_K >= 8) {
     // Step 1: splits 0-3 add splits 4-7
     if (split_id < 4) {
@@ -466,14 +484,39 @@ torch::Tensor awq_gemv_hip(torch::Tensor activation,  // [M, K] or [K]
   constexpr int THREADS_PER_SPLIT = 32;
 
   // Check natural divisibility for split-k
+  bool can_use_splitk_16 = (num_groups % 16 == 0);
   bool can_use_splitk_8 = (num_groups % 8 == 0);
   bool can_use_splitk_4 = (num_groups % 4 == 0);
   bool can_use_splitk_2 = (num_groups % 2 == 0);
 
-  if (can_use_splitk_8 && N <= 16384) {
+  if (can_use_splitk_16 && N <= 4096) {
+    // For small N, use split-k=16 for more K-parallelism (512 threads/block)
+    constexpr int SPLIT_K = 16;
+    constexpr int THREADS_PER_BLOCK = THREADS_PER_SPLIT * SPLIT_K;  // 512
+    // Verify threads don't exceed kernel launch bounds (512 for SPLIT_K=16)
+    static_assert(THREADS_PER_BLOCK <= 512,
+                  "THREADS_PER_BLOCK exceeds launch bounds for split_k=16");
+    int64_t num_blocks =
+        (total_outputs + THREADS_PER_SPLIT - 1) / THREADS_PER_SPLIT;
+    size_t smem_size =
+        SPLIT_K * THREADS_PER_SPLIT * OUTPUT_PER_THREAD * sizeof(float);
+
+    awq_gemv_kernel_splitk<8, SPLIT_K>
+        <<<num_blocks, THREADS_PER_BLOCK, smem_size, stream>>>(
+            reinterpret_cast<const __half*>(act_flat.data_ptr<at::Half>()),
+            reinterpret_cast<const uint32_t*>(qweight.data_ptr<int32_t>()),
+            reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+            reinterpret_cast<const uint32_t*>(qzeros.data_ptr<int32_t>()),
+            reinterpret_cast<__half*>(output.data_ptr<at::Half>()), 1,
+            static_cast<size_t>(K), static_cast<size_t>(N),
+            static_cast<size_t>(G));
+  } else if (can_use_splitk_8 && N <= 16384) {
     // Use split-k=8 for maximum parallelism
     constexpr int SPLIT_K = 8;
     constexpr int THREADS_PER_BLOCK = THREADS_PER_SPLIT * SPLIT_K;  // 256
+    // Verify threads don't exceed kernel launch bounds (256 for SPLIT_K<=8)
+    static_assert(THREADS_PER_BLOCK <= 256,
+                  "THREADS_PER_BLOCK exceeds launch bounds for split_k=8");
     int64_t num_blocks =
         (total_outputs + THREADS_PER_SPLIT - 1) / THREADS_PER_SPLIT;
     size_t smem_size =
@@ -492,6 +535,9 @@ torch::Tensor awq_gemv_hip(torch::Tensor activation,  // [M, K] or [K]
     // Small N: use split-k=4 for more parallelism
     constexpr int SPLIT_K = 4;
     constexpr int THREADS_PER_BLOCK = THREADS_PER_SPLIT * SPLIT_K;  // 128
+    // Verify threads don't exceed kernel launch bounds (256 for SPLIT_K<=8)
+    static_assert(THREADS_PER_BLOCK <= 256,
+                  "THREADS_PER_BLOCK exceeds launch bounds for split_k=4");
     int64_t num_blocks =
         (total_outputs + THREADS_PER_SPLIT - 1) / THREADS_PER_SPLIT;
     size_t smem_size =
@@ -510,6 +556,9 @@ torch::Tensor awq_gemv_hip(torch::Tensor activation,  // [M, K] or [K]
     // Medium N: use split-k=2
     constexpr int SPLIT_K = 2;
     constexpr int THREADS_PER_BLOCK = THREADS_PER_SPLIT * SPLIT_K;  // 64
+    // Verify threads don't exceed kernel launch bounds (256 for SPLIT_K<=8)
+    static_assert(THREADS_PER_BLOCK <= 256,
+                  "THREADS_PER_BLOCK exceeds launch bounds for split_k=2");
     int64_t num_blocks =
         (total_outputs + THREADS_PER_SPLIT - 1) / THREADS_PER_SPLIT;
     size_t smem_size =
@@ -529,6 +578,9 @@ torch::Tensor awq_gemv_hip(torch::Tensor activation,  // [M, K] or [K]
     // accumulators)
     constexpr int SPLIT_K = 1;
     constexpr int THREADS_PER_BLOCK = THREADS_PER_SPLIT * SPLIT_K;  // 32
+    // Verify threads don't exceed kernel launch bounds (256 for SPLIT_K<=8)
+    static_assert(THREADS_PER_BLOCK <= 256,
+                  "THREADS_PER_BLOCK exceeds launch bounds for split_k=1");
     int64_t num_blocks =
         (total_outputs + THREADS_PER_SPLIT - 1) / THREADS_PER_SPLIT;
     // No shared memory needed for SPLIT_K=1

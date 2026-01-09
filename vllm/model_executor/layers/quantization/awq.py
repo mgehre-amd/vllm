@@ -247,9 +247,73 @@ class AWQLinearMethod(LinearMethodBase):
         layer.register_parameter("scales", scales)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
-        layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
-        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
+        qweight = layer.qweight.data
+        qzeros = layer.qzeros.data
+        scales = layer.scales.data
+
+        # Apply K-padding for HIP GEMV kernel on ROCm
+        # The HIP kernel uses split-k parallelization that requires num_groups
+        # to be divisible by 4 or 8 for best performance. Pad weights with zeros
+        # to enable higher split-k factors.
+        from vllm.platforms import current_platform
+
+        group_size = self.quant_config.group_size
+        if current_platform.is_rocm() and group_size == 128:
+            K = qweight.shape[0]
+            N = qweight.shape[1] * 8  # Unpack factor
+            num_groups = qzeros.shape[0]
+
+            # Determine optimal padding based on output size (N)
+            # These thresholds match the kernel dispatch logic in awq_gemv_hip.cu
+            can_use_splitk_8 = num_groups % 8 == 0
+            can_use_splitk_4 = num_groups % 4 == 0
+
+            should_pad = False
+            padded_groups = num_groups
+
+            if N <= 8192:
+                # For small N: pad to enable split-k=8 if not already available
+                if not can_use_splitk_8 and not can_use_splitk_4:
+                    padded_groups = ((num_groups + 7) // 8) * 8
+                    should_pad = True
+            elif N <= 12288 and not can_use_splitk_4:
+                padded_groups = ((num_groups + 3) // 4) * 4
+                should_pad = True
+
+            if should_pad and padded_groups > num_groups:
+                pad_groups = padded_groups - num_groups
+                padded_K = K + pad_groups * group_size
+
+                # Pad qweight: [K, N//8] -> [padded_K, N//8]
+                qweight_padded = torch.zeros(
+                    (padded_K, qweight.shape[1]),
+                    dtype=qweight.dtype,
+                    device=qweight.device,
+                )
+                qweight_padded[:K] = qweight
+                qweight = qweight_padded
+
+                # Pad qzeros: [num_groups, N//8] -> [padded_groups, N//8]
+                qzeros_padded = torch.zeros(
+                    (padded_groups, qzeros.shape[1]),
+                    dtype=qzeros.dtype,
+                    device=qzeros.device,
+                )
+                qzeros_padded[:num_groups] = qzeros
+                qzeros = qzeros_padded
+
+                # Pad scales: [num_groups, N] -> [padded_groups, N]
+                scales_padded = torch.zeros(
+                    (padded_groups, scales.shape[1]),
+                    dtype=scales.dtype,
+                    device=scales.device,
+                )
+                scales_padded[:num_groups] = scales
+                scales = scales_padded
+
+        layer.qweight = torch.nn.Parameter(qweight, requires_grad=False)
+        layer.qzeros = torch.nn.Parameter(qzeros, requires_grad=False)
+        layer.scales = torch.nn.Parameter(scales, requires_grad=False)
 
     def apply(
         self,
