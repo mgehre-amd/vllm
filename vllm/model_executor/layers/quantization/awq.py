@@ -265,15 +265,23 @@ class AWQLinearMethod(LinearMethodBase):
 
             # Determine optimal padding based on output size (N)
             # These thresholds match the kernel dispatch logic in awq_gemv_hip.cu
+            can_use_splitk_16 = num_groups % 16 == 0
             can_use_splitk_8 = num_groups % 8 == 0
             can_use_splitk_4 = num_groups % 4 == 0
 
             should_pad = False
             padded_groups = num_groups
 
-            if N <= 8192:
-                # For small N: pad to enable split-k=8 if not already available
-                if not can_use_splitk_8 and not can_use_splitk_4:
+            # For small N, we need higher split-k for more K-parallelism
+            # Pad aggressively to enable the optimal split-k for each N range
+            if N <= 4096:
+                # For very small N: pad to enable split-k=16
+                if not can_use_splitk_16:
+                    padded_groups = ((num_groups + 15) // 16) * 16
+                    should_pad = True
+            elif N <= 8192:
+                # For small N: pad to enable split-k=8
+                if not can_use_splitk_8:
                     padded_groups = ((num_groups + 7) // 8) * 8
                     should_pad = True
             elif N <= 12288 and not can_use_splitk_4:
