@@ -381,18 +381,19 @@ __global__ __launch_bounds__(256) void awq_gemv_kernel_splitk(
 
   if (col_start >= N) return;
 
-  // Shared memory for reduction
-  extern __shared__ __half2 smem[];  // [2][THREADS_PER_SPLIT][ACC_HALF2_COUNT]
-  __half2* my_smem = &smem[split_id * THREADS_PER_SPLIT * ACC_HALF2_COUNT +
-                           thread_in_split * ACC_HALF2_COUNT];
+  // Shared memory for reduction (fp32 for precision)
+  extern __shared__ float
+      smem_f[];  // [SPLIT_K][THREADS_PER_SPLIT][OUTPUT_PER_THREAD]
+  float* my_smem = &smem_f[split_id * THREADS_PER_SPLIT * OUTPUT_PER_THREAD +
+                           thread_in_split * OUTPUT_PER_THREAD];
 
   typedef const uint32_t __attribute__((address_space(1))) * global_uint32_ptr;
 
-  // Accumulators
-  __half2 acc2[ACC_HALF2_COUNT];
+  // Accumulators in fp32 for precision
+  float acc[OUTPUT_PER_THREAD];
   #pragma unroll
-  for (int i = 0; i < ACC_HALF2_COUNT; i++) {
-    acc2[i] = __float2half2_rn(0.0f);
+  for (int i = 0; i < OUTPUT_PER_THREAD; i++) {
+    acc[i] = 0.0f;
   }
 
   // Starting group for this split
@@ -487,7 +488,7 @@ __global__ __launch_bounds__(256) void awq_gemv_kernel_splitk(
     do {                                                                      \
       __half2 a2 = act2[(slot) / 2];                                          \
       __half act_val = ((slot) % 2 == 0) ? __low2half(a2) : __high2half(a2);  \
-      __half2 act2_broadcast = __half2half2(act_val);                         \
+      float act_f = __half2float(act_val);                                    \
       _Pragma("unroll") for (int j = 0; j < UINT32_PER_LOAD; j++) {           \
         _Pragma("unroll") for (int b = 0; b < 4; b++) {                       \
           uint16_t w0 = static_cast<uint16_t>((w[slot][j] >> (b * 4)) & 0xF); \
@@ -495,11 +496,18 @@ __global__ __launch_bounds__(256) void awq_gemv_kernel_splitk(
               static_cast<uint16_t>((w[slot][j] >> (b * 4 + 16)) & 0xF);      \
           __half2 weight2 =                                                   \
               __halves2half2(__ushort2half_rn(w0), __ushort2half_rn(w1));     \
-          __half2 dequant2 =                                                  \
-              __hmul2(__hsub2(weight2, zeros2[curr_buf][j * 4 + b]),          \
-                      scales2[curr_buf][j * 4 + b]);                          \
-          acc2[j * 4 + b] =                                                   \
-              __hfma2(act2_broadcast, dequant2, acc2[j * 4 + b]);             \
+          /* dequant = (weight - zero) * scale in fp32 */                     \
+          __half2 z2 = zeros2[curr_buf][j * 4 + b];                           \
+          __half2 s2 = scales2[curr_buf][j * 4 + b];                          \
+          float dequant0 = (__half2float(__low2half(weight2)) -               \
+                            __half2float(__low2half(z2))) *                   \
+                           __half2float(__low2half(s2));                      \
+          float dequant1 = (__half2float(__high2half(weight2)) -              \
+                            __half2float(__high2half(z2))) *                  \
+                           __half2float(__high2half(s2));                     \
+          /* acc += activation * dequant in fp32 */                           \
+          acc[(j * 4 + b) * 2] += act_f * dequant0;                           \
+          acc[(j * 4 + b) * 2 + 1] += act_f * dequant1;                       \
         }                                                                     \
       }                                                                       \
     } while (0)
@@ -596,28 +604,28 @@ __global__ __launch_bounds__(256) void awq_gemv_kernel_splitk(
   #undef GET_W_PTR_SK
   #undef W_PTR_ADD_ROW_SK
 
-  // Store partial results to shared memory
+  // Store partial results to shared memory (fp32)
   #pragma unroll
-  for (int i = 0; i < ACC_HALF2_COUNT; i++) {
-    my_smem[i] = acc2[i];
+  for (int i = 0; i < OUTPUT_PER_THREAD; i++) {
+    my_smem[i] = acc[i];
   }
 
   __syncthreads();
 
-  // Tree reduction across splits
+  // Tree reduction across splits (in fp32)
   // For SPLIT_K=2: one reduction step
   // For SPLIT_K=4: two reduction steps
   // For SPLIT_K=8: three reduction steps
   if constexpr (SPLIT_K >= 8) {
     // Step 1: splits 0-3 add splits 4-7
     if (split_id < 4) {
-      __half2* other_smem =
-          &smem[(split_id + 4) * THREADS_PER_SPLIT * ACC_HALF2_COUNT +
-                thread_in_split * ACC_HALF2_COUNT];
+      float* other_smem =
+          &smem_f[(split_id + 4) * THREADS_PER_SPLIT * OUTPUT_PER_THREAD +
+                  thread_in_split * OUTPUT_PER_THREAD];
   #pragma unroll
-      for (int i = 0; i < ACC_HALF2_COUNT; i++) {
-        acc2[i] = __hadd2(my_smem[i], other_smem[i]);
-        my_smem[i] = acc2[i];
+      for (int i = 0; i < OUTPUT_PER_THREAD; i++) {
+        acc[i] = my_smem[i] + other_smem[i];
+        my_smem[i] = acc[i];
       }
     }
     __syncthreads();
@@ -626,13 +634,13 @@ __global__ __launch_bounds__(256) void awq_gemv_kernel_splitk(
   if constexpr (SPLIT_K >= 4) {
     // Step 2: splits 0-1 add splits 2-3
     if (split_id < 2) {
-      __half2* other_smem =
-          &smem[(split_id + 2) * THREADS_PER_SPLIT * ACC_HALF2_COUNT +
-                thread_in_split * ACC_HALF2_COUNT];
+      float* other_smem =
+          &smem_f[(split_id + 2) * THREADS_PER_SPLIT * OUTPUT_PER_THREAD +
+                  thread_in_split * OUTPUT_PER_THREAD];
   #pragma unroll
-      for (int i = 0; i < ACC_HALF2_COUNT; i++) {
-        acc2[i] = __hadd2(my_smem[i], other_smem[i]);
-        my_smem[i] = acc2[i];
+      for (int i = 0; i < OUTPUT_PER_THREAD; i++) {
+        acc[i] = my_smem[i] + other_smem[i];
+        my_smem[i] = acc[i];
       }
     }
     __syncthreads();
@@ -640,24 +648,20 @@ __global__ __launch_bounds__(256) void awq_gemv_kernel_splitk(
 
   // Final step: split 0 adds split 1
   if (split_id == 0) {
-    __half2* other_smem = &smem[1 * THREADS_PER_SPLIT * ACC_HALF2_COUNT +
-                                thread_in_split * ACC_HALF2_COUNT];
+    float* other_smem = &smem_f[1 * THREADS_PER_SPLIT * OUTPUT_PER_THREAD +
+                                thread_in_split * OUTPUT_PER_THREAD];
 
   #pragma unroll
-    for (int i = 0; i < ACC_HALF2_COUNT; i++) {
-      acc2[i] = __hadd2(my_smem[i], other_smem[i]);
+    for (int i = 0; i < OUTPUT_PER_THREAD; i++) {
+      acc[i] = my_smem[i] + other_smem[i];
     }
 
-  // Write outputs
+    // Write outputs (convert fp32 accumulators to fp16)
   #pragma unroll
-    for (int i = 0; i < ACC_HALF2_COUNT; i++) {
-      size_t col0 = col_start + i * 2;
-      size_t col1 = col_start + i * 2 + 1;
-      if (col0 < N) {
-        output[col0] = __low2half(acc2[i]);
-      }
-      if (col1 < N) {
-        output[col1] = __high2half(acc2[i]);
+    for (int i = 0; i < OUTPUT_PER_THREAD; i++) {
+      size_t col = col_start + i;
+      if (col < N) {
+        output[col] = __float2half(acc[i]);
       }
     }
   }
@@ -772,14 +776,14 @@ torch::Tensor awq_gemv_hip(torch::Tensor activation,  // [M, K] or [K]
   bool can_use_splitk_4 = (num_groups % 4 == 0);
   bool can_use_splitk_2 = (num_groups % 2 == 0);
 
-  if (can_use_splitk_8 && N <= 8192) {
-    // Very small N: use split-k=8 for maximum parallelism
+  if (can_use_splitk_8 && N <= 16384) {
+    // Use split-k=8 for maximum parallelism
     constexpr int SPLIT_K = 8;
     constexpr int THREADS_PER_BLOCK = THREADS_PER_SPLIT * SPLIT_K;  // 256
     int64_t num_blocks =
         (total_outputs + THREADS_PER_SPLIT - 1) / THREADS_PER_SPLIT;
     size_t smem_size =
-        SPLIT_K * THREADS_PER_SPLIT * (OUTPUT_PER_THREAD / 2) * sizeof(__half2);
+        SPLIT_K * THREADS_PER_SPLIT * OUTPUT_PER_THREAD * sizeof(float);
 
     awq_gemv_kernel_splitk<8, SPLIT_K>
         <<<num_blocks, THREADS_PER_BLOCK, smem_size, stream>>>(
@@ -790,14 +794,14 @@ torch::Tensor awq_gemv_hip(torch::Tensor activation,  // [M, K] or [K]
             reinterpret_cast<__half*>(output.data_ptr<at::Half>()), 1,
             static_cast<size_t>(K), static_cast<size_t>(N),
             static_cast<size_t>(G));
-  } else if (can_use_splitk_4 && N <= 12288) {
+  } else if (can_use_splitk_4 && N <= 24576) {
     // Small N: use split-k=4 for more parallelism
     constexpr int SPLIT_K = 4;
     constexpr int THREADS_PER_BLOCK = THREADS_PER_SPLIT * SPLIT_K;  // 128
     int64_t num_blocks =
         (total_outputs + THREADS_PER_SPLIT - 1) / THREADS_PER_SPLIT;
     size_t smem_size =
-        SPLIT_K * THREADS_PER_SPLIT * (OUTPUT_PER_THREAD / 2) * sizeof(__half2);
+        SPLIT_K * THREADS_PER_SPLIT * OUTPUT_PER_THREAD * sizeof(float);
 
     awq_gemv_kernel_splitk<8, SPLIT_K>
         <<<num_blocks, THREADS_PER_BLOCK, smem_size, stream>>>(
@@ -808,14 +812,14 @@ torch::Tensor awq_gemv_hip(torch::Tensor activation,  // [M, K] or [K]
             reinterpret_cast<__half*>(output.data_ptr<at::Half>()), 1,
             static_cast<size_t>(K), static_cast<size_t>(N),
             static_cast<size_t>(G));
-  } else if (can_use_splitk_2 && N <= 16384) {
+  } else if (can_use_splitk_2 && N <= 32768) {
     // Medium N: use split-k=2
     constexpr int SPLIT_K = 2;
     constexpr int THREADS_PER_BLOCK = THREADS_PER_SPLIT * SPLIT_K;  // 64
     int64_t num_blocks =
         (total_outputs + THREADS_PER_SPLIT - 1) / THREADS_PER_SPLIT;
     size_t smem_size =
-        SPLIT_K * THREADS_PER_SPLIT * (OUTPUT_PER_THREAD / 2) * sizeof(__half2);
+        SPLIT_K * THREADS_PER_SPLIT * OUTPUT_PER_THREAD * sizeof(float);
 
     awq_gemv_kernel_splitk<8, SPLIT_K>
         <<<num_blocks, THREADS_PER_BLOCK, smem_size, stream>>>(
