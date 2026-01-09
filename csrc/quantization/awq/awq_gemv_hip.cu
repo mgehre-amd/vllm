@@ -794,7 +794,7 @@ torch::Tensor awq_gemv_hip(torch::Tensor activation,  // [M, K] or [K]
             reinterpret_cast<__half*>(output.data_ptr<at::Half>()), 1,
             static_cast<size_t>(K), static_cast<size_t>(N),
             static_cast<size_t>(G));
-  } else if (can_use_splitk_4 && N <= 24576) {
+  } else if (can_use_splitk_4) {
     // Small N: use split-k=4 for more parallelism
     constexpr int SPLIT_K = 4;
     constexpr int THREADS_PER_BLOCK = THREADS_PER_SPLIT * SPLIT_K;  // 128
@@ -812,7 +812,7 @@ torch::Tensor awq_gemv_hip(torch::Tensor activation,  // [M, K] or [K]
             reinterpret_cast<__half*>(output.data_ptr<at::Half>()), 1,
             static_cast<size_t>(K), static_cast<size_t>(N),
             static_cast<size_t>(G));
-  } else if (can_use_splitk_2 && N <= 32768) {
+  } else if (can_use_splitk_2) {
     // Medium N: use split-k=2
     constexpr int SPLIT_K = 2;
     constexpr int THREADS_PER_BLOCK = THREADS_PER_SPLIT * SPLIT_K;  // 64
