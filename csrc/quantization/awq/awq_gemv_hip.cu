@@ -85,14 +85,10 @@ __launch_bounds__(SPLIT_K <= 8 ? 256 : 512) void awq_gemv_kernel_splitk(
   size_t start_row = start_group * G;  // G elements per group
 
   // Pointer setup - offset to starting row
-  size_t weight_row_stride = (N / 8) * sizeof(uint32_t);
-  size_t weight_ptr_val = reinterpret_cast<size_t>(qweight) +
-                          tid * UINT32_PER_LOAD * sizeof(uint32_t) +
-                          start_row * weight_row_stride;
-  uint32_t w_ptr_lo = static_cast<uint32_t>(weight_ptr_val);
-  uint32_t w_ptr_hi = static_cast<uint32_t>(weight_ptr_val >> 32);
-  uint32_t w_stride_lo = static_cast<uint32_t>(weight_row_stride);
-  uint32_t w_stride_hi = static_cast<uint32_t>(weight_row_stride >> 32);
+  // Use simplified pointer with compiler barrier to limit register pressure
+  size_t weight_row_stride = N / 8;  // in uint32_t elements
+  const uint32_t* w_ptr =
+      qweight + tid * UINT32_PER_LOAD + start_row * weight_row_stride;
 
   size_t zeros_row_stride = (N / 8) * sizeof(uint32_t);
   size_t zeros_ptr_val = reinterpret_cast<size_t>(qzeros) +
@@ -104,16 +100,15 @@ __launch_bounds__(SPLIT_K <= 8 ? 256 : 512) void awq_gemv_kernel_splitk(
 
   const __half* act_ptr = activation + start_row;
 
-  #define W_PTR_ADD_ROW_SK()                           \
-    asm volatile(                                      \
-        "v_add_co_u32 %0, vcc_lo, %0, %2\n\t"          \
-        "v_add_co_ci_u32_e64 %1, null, %1, %3, vcc_lo" \
-        : "+v"(w_ptr_lo), "+v"(w_ptr_hi)               \
-        : "v"(w_stride_lo), "v"(w_stride_hi))
+  // Simplified pointer arithmetic with memory clobber to limit unrolling
+  #define W_PTR_ADD_ROW_SK()         \
+    do {                             \
+      w_ptr += weight_row_stride;    \
+      asm volatile("" ::: "memory"); \
+    } while (0)
 
-  #define GET_W_PTR_SK()                 \
-    reinterpret_cast<global_uint32_ptr>( \
-        (static_cast<size_t>(w_ptr_hi) << 32) | w_ptr_lo)
+  #define GET_W_PTR_SK() \
+    reinterpret_cast<global_uint32_ptr>(reinterpret_cast<size_t>(w_ptr))
 
   // Pipeline registers
   uint32_t w[PIPELINE_DEPTH][UINT32_PER_LOAD];

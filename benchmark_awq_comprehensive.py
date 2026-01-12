@@ -395,7 +395,7 @@ def main():
 
     # Best known performance (GB/s) for each shape (N, K, group_size)
     # Used to detect performance regressions
-    # Updated: 2026-01-12 with latest kernel improvements
+    # Updated: 2026-01-12 with hybrid pointer optimization (simplified ptr + memory barrier)
     # Tolerance: 5% below reference triggers a warning
     PERF_TOLERANCE = 0.05  # 5% tolerance for measurement noise
     BEST_KNOWN_PERF = {
@@ -404,39 +404,39 @@ def main():
         # Small shapes (N*K < 10M) have lower efficiency due to launch overhead
         #
         # Qwen2.5-0.5B-Instruct
-        (896, 896, 128): 21.5,
-        (1152, 896, 128): 25.3,
-        (9728, 896, 128): 152.0,
-        (896, 4864, 128): 59.4,
+        (896, 896, 128): 21.6,
+        (1152, 896, 128): 25.7,
+        (9728, 896, 128): 149.0,
+        (896, 4864, 128): 60.0,
         # Gemma-2B - small N shapes have lower efficiency
-        (2048, 2048, 128): 110.0,  # improved with split_k=16 (~48% eff)
-        (2560, 2048, 128): 134.0,  # improved with split_k=16
-        (32768, 2048, 128): 200.0,  # large N, good efficiency
-        (2048, 16384, 128): 171.0,  # improved with split_k=16 (~74% eff)
+        (2048, 2048, 128): 125.0,  # improved +14% with hybrid pointer opt
+        (2560, 2048, 128): 141.0,  # improved +5% with hybrid pointer opt
+        (32768, 2048, 128): 198.0,  # large N, good efficiency
+        (2048, 16384, 128): 199.0,  # improved +16% with hybrid pointer opt
         # Qwen3-1.7B / Qwen3-VL-2B / Cosmos-Reason2-2B - all K divisible by 16
-        (4096, 2048, 128): 166.0,  # qkv fused, split_k=4 (~72% eff)
-        (12288, 2048, 128): 202.0,  # gate_up, large N (~88% eff)
-        (2048, 6144, 128): 150.0,  # down_proj, split_k=24 (~65% eff)
+        (4096, 2048, 128): 167.0,  # qkv fused, split_k=4 (~72% eff)
+        (12288, 2048, 128): 200.0,  # gate_up, large N (~87% eff)
+        (2048, 6144, 128): 174.0,  # improved +17% with hybrid pointer opt
         # Qwen3-4B
-        (2560, 2560, 128): 80.0,  # small shape (~35% eff)
-        (6144, 2560, 128): 170.0,  # qkv fused (~74% eff)
+        (2560, 2560, 128): 86.0,  # improved +8% with hybrid pointer opt
+        (6144, 2560, 128): 188.0,  # improved +11% with hybrid pointer opt
         (19456, 2560, 128): 218.0,  # large N, ~94% eff
-        (2560, 9728, 128): 180.0,  # padded to 10240 (~78% eff)
+        (2560, 9728, 128): 190.0,  # improved +6% with hybrid pointer opt
         # Qwen2.5-7B - padded for optimal split_k where overhead < 15%
-        (3584, 3584, 128): 160.0,  # small N, padded for split_k=7 (~70% eff)
-        (4608, 3584, 128): 155.0,  # padded for split_k=14 (~67% eff)
-        (37888, 3584, 128): 217.0,  # large N, no padding needed
-        (3584, 18944, 128): 200.0,  # padded for split_k=37 (~87% eff)
+        (3584, 3584, 128): 163.0,  # small N, padded for split_k=7 (~71% eff)
+        (4608, 3584, 128): 162.0,  # improved +4% with hybrid pointer opt
+        (37888, 3584, 128): 218.0,  # large N, no padding needed
+        (3584, 18944, 128): 204.0,  # padded for split_k=37 (~88% eff)
         # LLaMA2-7B
-        (4096, 4096, 128): 188.0,
-        (6144, 4096, 128): 203.0,
-        (11008, 4096, 128): 208.0,
-        (12288, 4096, 128): 216.0,
-        (22016, 4096, 128): 220.0,
-        (4096, 11008, 128): 195.0,
+        (4096, 4096, 128): 187.0,
+        (6144, 4096, 128): 209.0,  # improved +3% with hybrid pointer opt
+        (11008, 4096, 128): 209.0,
+        (12288, 4096, 128): 215.0,
+        (22016, 4096, 128): 221.0,
+        (4096, 11008, 128): 194.0,
         # Additional
-        (2560, 4096, 128): 163.0,
-        (19456, 9728, 128): 226.0,
+        (2560, 4096, 128): 169.0,  # improved +4% with hybrid pointer opt
+        (19456, 9728, 128): 228.0,  # improved +1% with hybrid pointer opt
     }
 
     def calculate_bytes(K, N, group_size):
