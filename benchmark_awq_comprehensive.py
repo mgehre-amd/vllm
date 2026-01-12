@@ -381,6 +381,10 @@ def main():
         (2560, 2048, 128),  # qkv fused (2048 + 256 + 256 for MQA)
         (32768, 2048, 128),  # gate_up_proj (16384 * 2)
         (2048, 16384, 128),  # down_proj
+        # Qwen3-1.7B / Qwen3-VL-2B / Cosmos-Reason2-2B (hidden=2048, intermediate=6144)
+        (4096, 2048, 128),  # qkv fused (2048 + 1024 + 1024)
+        (12288, 2048, 128),  # gate_up_proj (6144 * 2)
+        (2048, 6144, 128),  # down_proj
         # Qwen3-4B (hidden=2560, intermediate=9728, 32 heads, 8 kv heads)
         (2560, 2560, 128),  # q/o proj
         (6144, 2560, 128),  # qkv fused (actual from profile)
@@ -424,6 +428,10 @@ def main():
         (2560, 2048, 128): 134.0,  # improved with split_k=16
         (32768, 2048, 128): 200.0,  # large N, good efficiency
         (2048, 16384, 128): 171.0,  # improved with split_k=16 (~74% eff)
+        # Qwen3-1.7B / Qwen3-VL-2B / Cosmos-Reason2-2B - all K divisible by 16
+        (4096, 2048, 128): 145.0,  # qkv fused, split_k=16 (~66% eff)
+        (12288, 2048, 128): 180.0,  # gate_up, large N (~82% eff)
+        (2048, 6144, 128): 120.0,  # down_proj, split_k=16 (~55% eff)
         # Qwen3-4B
         (2560, 2560, 128): 95.0,  # small shape, padded to 4096 (~44% eff)
         (6144, 2560, 128): 175.0,  # qkv fused (~78% eff)
