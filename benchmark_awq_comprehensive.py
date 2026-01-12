@@ -17,8 +17,10 @@ from vllm.triton_utils import triton
 def check_gpu_idle(threshold_pct=5.0):
     """Check if GPU is idle before running benchmarks.
 
-    Returns True if GPU utilization is below threshold, False otherwise.
-    Prints a warning if GPU is busy.
+    Returns (is_idle, utilization, error_msg) tuple:
+    - is_idle: True if GPU utilization is below threshold
+    - utilization: GPU utilization percentage (None if couldn't check)
+    - error_msg: Error message if couldn't check (None otherwise)
     """
     import json
     import subprocess
@@ -43,17 +45,7 @@ def check_gpu_idle(threshold_pct=5.0):
                     except (ValueError, AttributeError):
                         utilization = 0.0
 
-                    if utilization > threshold_pct:
-                        print(
-                            f"\n⚠️  WARNING: GPU is busy! Utilization: {utilization:.1f}%"
-                        )
-                        print(
-                            "   Benchmark results may be inaccurate. Please ensure no other GPU workloads are running.\n"
-                        )
-                        return False
-                    else:
-                        print(f"✓ GPU is idle (utilization: {utilization:.1f}%)")
-                        return True
+                    return (utilization <= threshold_pct, utilization, None)
         else:
             # Try alternative method using rocm-smi without JSON
             result = subprocess.run(
@@ -67,23 +59,13 @@ def check_gpu_idle(threshold_pct=5.0):
                         if len(parts) >= 2:
                             try:
                                 utilization = float(parts[-1].strip())
-                                if utilization > threshold_pct:
-                                    print(
-                                        f"\n⚠️  WARNING: GPU is busy! Utilization: {utilization:.1f}%"
-                                    )
-                                    print("   Benchmark results may be inaccurate.\n")
-                                    return False
-                                else:
-                                    print(
-                                        f"✓ GPU is idle (utilization: {utilization:.1f}%)"
-                                    )
-                                    return True
+                                return (utilization <= threshold_pct, utilization, None)
                             except ValueError:
                                 pass
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as e:
-        print(f"Note: Could not check GPU utilization ({e})")
+        return (True, None, str(e))
 
-    return True  # Assume idle if we can't check
+    return (True, None, "Could not parse GPU utilization")
 
 
 def load_autoawq_kernel():
@@ -357,6 +339,9 @@ def main():
 
     PEAK_BW = args.peak_bw
 
+    # Check GPU utilization early, before any GPU work (result printed in summary)
+    gpu_idle, gpu_utilization, gpu_error = check_gpu_idle()
+
     # Import after setting env var
     from vllm.model_executor.layers.quantization.awq_triton import (
         _awq_gemm_triton,
@@ -410,7 +395,7 @@ def main():
 
     # Best known performance (GB/s) for each shape (N, K, group_size)
     # Used to detect performance regressions
-    # Updated: 2025-01-09 with fp32 accumulator split-k kernel
+    # Updated: 2026-01-12 with latest kernel improvements
     # Tolerance: 5% below reference triggers a warning
     PERF_TOLERANCE = 0.05  # 5% tolerance for measurement noise
     BEST_KNOWN_PERF = {
@@ -429,30 +414,29 @@ def main():
         (32768, 2048, 128): 200.0,  # large N, good efficiency
         (2048, 16384, 128): 171.0,  # improved with split_k=16 (~74% eff)
         # Qwen3-1.7B / Qwen3-VL-2B / Cosmos-Reason2-2B - all K divisible by 16
-        (4096, 2048, 128): 145.0,  # qkv fused, split_k=16 (~66% eff)
-        (12288, 2048, 128): 180.0,  # gate_up, large N (~82% eff)
-        (2048, 6144, 128): 120.0,  # down_proj, split_k=16 (~55% eff)
+        (4096, 2048, 128): 166.0,  # qkv fused, split_k=4 (~72% eff)
+        (12288, 2048, 128): 202.0,  # gate_up, large N (~88% eff)
+        (2048, 6144, 128): 150.0,  # down_proj, split_k=24 (~65% eff)
         # Qwen3-4B
-        (2560, 2560, 128): 95.0,  # small shape, padded to 4096 (~44% eff)
-        (6144, 2560, 128): 175.0,  # qkv fused (~78% eff)
-        (19456, 2560, 128): 220.0,  # large N, ~95% eff
-        (2560, 9728, 128): 175.0,  # padded to 10240 (~79% eff)
+        (2560, 2560, 128): 80.0,  # small shape (~35% eff)
+        (6144, 2560, 128): 170.0,  # qkv fused (~74% eff)
+        (19456, 2560, 128): 218.0,  # large N, ~94% eff
+        (2560, 9728, 128): 180.0,  # padded to 10240 (~78% eff)
         # Qwen2.5-7B - padded for optimal split_k where overhead < 15%
-        (3584, 3584, 128): 155.0,  # small N, padded for split_k=8 (~70% eff)
-        (4608, 3584, 128): 150.0,  # padded for split_k=8 (~66% eff)
-        (37888, 3584, 128): 215.0,  # large N, no padding needed
-        (3584, 18944, 128): 195.0,  # padded for split_k=16 (~87% eff)
+        (3584, 3584, 128): 160.0,  # small N, padded for split_k=7 (~70% eff)
+        (4608, 3584, 128): 155.0,  # padded for split_k=14 (~67% eff)
+        (37888, 3584, 128): 217.0,  # large N, no padding needed
+        (3584, 18944, 128): 200.0,  # padded for split_k=37 (~87% eff)
         # LLaMA2-7B
-        (4096, 4096, 128): 187.0,
-        (6144, 4096, 128): 200.0,
-        (11008, 4096, 128): 206.0,
+        (4096, 4096, 128): 188.0,
+        (6144, 4096, 128): 203.0,
+        (11008, 4096, 128): 208.0,
         (12288, 4096, 128): 216.0,
         (22016, 4096, 128): 220.0,
-        (4096, 11008, 128): 203.0,
+        (4096, 11008, 128): 195.0,
         # Additional
-        (6144, 2560, 128): 160.0,  # adjusted
         (2560, 4096, 128): 163.0,
-        (19456, 9728, 128): 225.0,
+        (19456, 9728, 128): 226.0,
     }
 
     def calculate_bytes(K, N, group_size):
@@ -758,8 +742,8 @@ def main():
 
     def run_benchmark(shapes, include_autoawq=False, autoawq_module=None):
         """Run benchmarks for all shapes."""
-        # Check if GPU is idle before benchmarking
-        check_gpu_idle()
+        # GPU idle check moved to start of main() to avoid false positives
+        # from our own correctness tests
 
         print("\n" + "=" * 130)
         print("BENCHMARK RESULTS (with HIP preprocessing)")
@@ -1249,6 +1233,16 @@ Based on benchmarking, consider these changes for Strix Halo:
     print("\n" + "=" * 100)
     print("SUMMARY")
     print("=" * 100)
+
+    # Print GPU utilization status (checked at start of run)
+    if gpu_error:
+        print(f"Note: Could not check GPU utilization ({gpu_error})")
+    elif gpu_idle:
+        print(f"✓ GPU was idle at start (utilization: {gpu_utilization:.1f}%)")
+    else:
+        print(f"⚠️  WARNING: GPU was busy at start! Utilization: {gpu_utilization:.1f}%")
+        print("   Benchmark results may be inaccurate.")
+
     print(f"""
 Peak memory bandwidth: {PEAK_BW} GB/s (measured via copy benchmark)
 """)
