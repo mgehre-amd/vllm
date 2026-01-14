@@ -85,7 +85,6 @@ __launch_bounds__(SPLIT_K <= 8 ? 256 : 512) void awq_gemv_kernel_splitk(
   size_t start_row = start_group * G;  // G elements per group
 
   // Pointer setup - offset to starting row
-  // Use simplified pointer with compiler barrier to limit register pressure
   size_t weight_row_stride = N / 8;  // in uint32_t elements
   const uint32_t* w_ptr =
       qweight + tid * UINT32_PER_LOAD + start_row * weight_row_stride;
@@ -100,7 +99,15 @@ __launch_bounds__(SPLIT_K <= 8 ? 256 : 512) void awq_gemv_kernel_splitk(
 
   const __half* act_ptr = activation + start_row;
 
-  // Simplified pointer arithmetic with memory clobber to limit unrolling
+  // Simplified pointer arithmetic with memory clobber to limit cross-iteration
+  // optimization The asm barrier prevents the compiler from over-optimizing
+  // across loop iterations which would blow up register usage (205 VGPRs
+  // without barrier, 140 with barrier) NOTE: We tried volatile, #pragma
+  // nounroll, opaque casts, noinline functions,
+  // __launch_bounds__(maxThreads, minBlocks), and partial unrolling (#pragma
+  // unroll N) but only asm volatile("" ::: "memory") achieves the right balance
+  // of preventing over-optimization while still allowing full loop unrolling
+  // for ILP.
   #define W_PTR_ADD_ROW_SK()         \
     do {                             \
       w_ptr += weight_row_stride;    \
@@ -196,7 +203,7 @@ __launch_bounds__(SPLIT_K <= 8 ? 256 : 512) void awq_gemv_kernel_splitk(
   EXTRACT_ZEROS_IN_BUF_SK(0);
   LOAD_SCALES_TO_BUF_SK(start_group, 0);
 
-  // Load first 16 weight rows
+  // Load first 16 weight rows (partial unroll to reduce register pressure)
   #pragma unroll
   for (int slot = 0; slot < PIPELINE_DEPTH; slot++) {
     global_uint32_ptr p = GET_W_PTR_SK();
