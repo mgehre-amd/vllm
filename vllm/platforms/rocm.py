@@ -377,6 +377,9 @@ class RocmPlatform(Platform):
         from vllm._aiter_ops import rocm_aiter_ops
         from vllm.config.compilation import CUDAGraphMode
 
+        # Use hipblaslt as the default BLAS library for better performance
+        torch.backends.cuda.preferred_blas_library("hipblaslt")
+
         cache_config = vllm_config.cache_config
         compilation_config = vllm_config.compilation_config
         parallel_config = vllm_config.parallel_config
