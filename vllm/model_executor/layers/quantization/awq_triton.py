@@ -881,9 +881,13 @@ def _awq_gemm_triton(
     scales: torch.Tensor,
     qzeros: torch.Tensor,
     split_k_iters: int,
-    block_size_m: int = 16,
-    block_size_n: int = 64,
-    block_size_k: int = 64,
+    # NOTE: These defaults materially impact prefill performance.
+    # The older ROCm build (f37e8938) used 32/32/32; keep as default to avoid
+    # regressions on common AWQ prefill shapes (e.g., M=128, K=4096, N in
+    # {4096, 12288, 22016} with chunked prefill).
+    block_size_m: int = 32,
+    block_size_n: int = 32,
+    block_size_k: int = 32,
 ) -> torch.Tensor:
     M, K = input.shape
     N = qweight.shape[1] * 8
