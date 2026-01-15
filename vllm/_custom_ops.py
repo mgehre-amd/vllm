@@ -504,7 +504,7 @@ def _awq_gemm(
     split_k_iters: int,
 ) -> torch.Tensor:
     # num_tokens >= threshold
-    FP16_MATMUL_HEURISTIC_CONDITION = input.shape[0] >= 256
+    FP16_MATMUL_HEURISTIC_CONDITION = input.shape[0] >= 64
 
     if FP16_MATMUL_HEURISTIC_CONDITION:
         out = awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
