@@ -2719,6 +2719,40 @@ class GPUModelRunner(
         finally:
             self.prepare_inputs_event.record()
 
+    @contextmanager
+    def _prefer_hipblaslt_for_logits(self):
+        """Prefer hipBLASLt for LM-head matmuls on ROCm.
+
+        We keep the global BLAS backend at PyTorch defaults to avoid prefill
+        regressions (e.g. AWQ fp16 dequantize+matmul path can be sensitive to
+        backend choice), but temporarily switch to hipBLASLt around logits
+        computation where it can improve decode throughput for unquantized
+        lm_head on ROCm.
+        """
+        # Only meaningful on ROCm.
+        if torch.version.hip is None:
+            yield
+            return
+
+        try:
+            prev = torch.backends.cuda.preferred_blas_library()
+            # Avoid redundant sets if already on lt.
+            if str(prev).endswith("Cublaslt"):
+                yield
+                return
+            torch.backends.cuda.preferred_blas_library("hipblaslt")
+            yield
+        except Exception:
+            # If backend selection fails for any reason, fall back silently.
+            yield
+        finally:
+            try:
+                # Restore prior backend if we changed it.
+                if "prev" in locals():
+                    torch.backends.cuda.preferred_blas_library(prev)
+            except Exception:
+                pass
+
     def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -3101,7 +3135,8 @@ class GPUModelRunner(
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                with self._prefer_hipblaslt_for_logits():
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -3120,7 +3155,8 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                    with self._prefer_hipblaslt_for_logits():
+                        logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -3803,7 +3839,8 @@ class GPUModelRunner(
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
+            with self._prefer_hipblaslt_for_logits():
+                logits = self.model.compute_logits(prompt_hidden_states)
 
             # Get the "target" tokens for each index. For prompt at index i,
             # the token at prompt index i+1 is the "sampled" token we want
@@ -4216,7 +4253,8 @@ class GPUModelRunner(
         # To avoid breaking the sampler, we use a random tensor here instead.
         hidden_states = torch.rand_like(hidden_states)
 
-        logits = self.model.compute_logits(hidden_states)
+        with self._prefer_hipblaslt_for_logits():
+            logits = self.model.compute_logits(hidden_states)
         num_reqs = logits.size(0)
 
         dummy_tensors = lambda v: torch.full((num_reqs,), v, device=self.device)
