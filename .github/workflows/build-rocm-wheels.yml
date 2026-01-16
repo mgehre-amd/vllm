@@ -51,10 +51,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install build wheel setuptools setuptools-scm ninja cmake packaging jinja2
 
-      - name: Install PyTorch from ROCm nightly
+      - name: Install PyTorch and ROCm SDK from nightly
         run: |
+          # Install PyTorch with ROCm
           pip install torch torchvision --index-url ${{ env.PYTORCH_INDEX_URL }}
-          python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+          
+          # Install ROCm SDK with devel and libraries extras
+          pip install "rocm[devel,libraries]" --index-url ${{ env.PYTORCH_INDEX_URL }} || \
+            echo "Warning: Could not install rocm[devel,libraries]"
+          
+          # Initialize ROCm SDK (creates symlinks, etc.)
+          rocm-sdk init || echo "Warning: rocm-sdk init failed"
+          
+          # Show what's installed
+          pip list | grep -i -E "rocm|torch|sdk" || true
+          python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'HIP: {torch.version.hip}'); print(f'CUDA: {torch.version.cuda}')"
 
       - name: Configure ROCm environment
         id: rocm-env
@@ -63,14 +74,23 @@ jobs:
           SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
           echo "SITE_PACKAGES=$SITE_PACKAGES"
           
+          # List what ROCm packages are installed
+          echo "=== ROCm packages in site-packages ==="
+          ls -la "$SITE_PACKAGES" | grep -i rocm || true
+          ls -la "$SITE_PACKAGES/_rocm"* 2>/dev/null || true
+          
           # Set ROCm paths based on AMD nightly wheel structure
           ROCM_PATH="$SITE_PACKAGES/_rocm_sdk_devel"
           HIP_DEVICE_LIB_PATH="$SITE_PACKAGES/_rocm_sdk_core/lib/llvm/amdgcn/bitcode"
           ROCM_BIN="$ROCM_PATH/bin"
           
-          # Verify paths exist
-          ls -la "$ROCM_PATH" || echo "Warning: ROCM_PATH not found"
-          ls -la "$HIP_DEVICE_LIB_PATH" || echo "Warning: HIP_DEVICE_LIB_PATH not found"
+          echo "=== ROCM_PATH contents ==="
+          ls -la "$ROCM_PATH" 2>/dev/null || echo "Warning: ROCM_PATH not found"
+          ls -la "$ROCM_PATH/bin" 2>/dev/null || echo "Warning: ROCM_PATH/bin not found"
+          ls -la "$ROCM_PATH/lib/llvm/bin" 2>/dev/null || echo "Warning: ROCM_PATH/lib/llvm/bin not found"
+          
+          echo "=== HIP_DEVICE_LIB_PATH contents ==="
+          ls -la "$HIP_DEVICE_LIB_PATH" 2>/dev/null | head -20 || echo "Warning: HIP_DEVICE_LIB_PATH not found"
           
           # Export to GITHUB_ENV for subsequent steps
           echo "ROCM_PATH=$ROCM_PATH" >> $GITHUB_ENV
@@ -78,8 +98,9 @@ jobs:
           echo "PATH=$ROCM_BIN:$PATH" >> $GITHUB_ENV
           
           # Verify hipcc is available
+          echo "=== Checking hipcc ==="
           which hipcc || echo "hipcc not found in PATH"
-          hipcc --version || echo "hipcc version check failed"
+          cat $(which hipcc) 2>/dev/null | head -50 || true
 
       - name: Install vLLM build requirements
         run: |
