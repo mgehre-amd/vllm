@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>vLLM Regression Comparison - 2026-01-16 07:00</title>
+    <meta charset="UTF-8">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; background: #f5f5f5; padding: 20px; }
+        .container { max-width: 1800px; margin: 0 auto; background: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .header { background: linear-gradient(135deg, #22c55e 0%, #3b82f6 100%); color: white; padding: 30px; }
+        .header h1 { font-size: 28px; margin-bottom: 10px; }
+        .subline { opacity: 0.9; margin-top: 6px; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; padding: 18px 24px; background: #f8f9fa; }
+        .stat { text-align: center; padding: 14px; background: white; border-radius: 6px; }
+        .stat-value { font-size: 28px; font-weight: bold; margin-bottom: 4px; }
+        .stat.total .stat-value { color: #0ea5e9; }
+        .stat.passed .stat-value { color: #10b981; }
+        .stat.failed .stat-value { color: #ef4444; }
+        .stat.delta-better .stat-value { color: #16a34a; }
+        .stat.delta-worse .stat-value { color: #dc2626; }
+        table { width: 100%; border-collapse: collapse; }
+        th { padding: 14px; text-align: left; font-weight: 600; cursor: pointer; }
+        td { padding: 12px 14px; border-bottom: 1px solid #f0f0f0; }
+        tr:hover { background: #f8f9fa; }
+        .status-pass { background: #10b981; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px; }
+        .status-fail { background: #ef4444; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px; }
+        .status-timeout { background: #f59e0b; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px; }
+        .status-error { background: #b91c1c; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px; }
+        .status-missing { background: #6b7280; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px; }
+        .delta-better { color: #16a34a; font-weight: 600; }
+        .delta-worse { color: #dc2626; font-weight: 600; }
+        .delta-same { color: #6b7280; }
+        .mono { font-family: SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace; }
+        .note { padding: 12px 18px; background: #e0f2fe; color: #0f172a; margin: 0 24px 16px; border-radius: 6px; }
+        .section-start { border-left: 3px solid #cbd5e1; }
+    </style>
+    
+<script>
+// Simple table sorter: toggles asc/desc and handles numeric columns
+function makeTableSortable(tableId) {
+    const table = document.getElementById(tableId);
+    if (!table) return;
+    const headers = table.querySelectorAll('th');
+    headers.forEach((th, idx) => {
+        th.addEventListener('click', () => sortBy(idx, th));
+    });
+
+    function sortBy(idx, th) {
+        const tbody = table.querySelector('tbody');
+        const rows = Array.from(tbody.querySelectorAll('tr'));
+        const current = th.getAttribute('data-sort') || 'asc';
+        const nextDir = current === 'asc' ? 'desc' : 'asc';
+        headers.forEach(h => h.removeAttribute('data-sort'));
+        th.setAttribute('data-sort', nextDir);
+
+        const isNumeric = th.getAttribute('data-type') === 'num';
+        rows.sort((a, b) => {
+            const aText = a.children[idx].innerText.trim();
+            const bText = b.children[idx].innerText.trim();
+            const aVal = isNumeric ? parseFloat(aText) : aText.toLowerCase();
+            const bVal = isNumeric ? parseFloat(bText) : bText.toLowerCase();
+            if (isNaN(aVal) && isNumeric) return 1;
+            if (isNaN(bVal) && isNumeric) return -1;
+            if (aVal < bVal) return nextDir === 'asc' ? -1 : 1;
+            if (aVal > bVal) return nextDir === 'asc' ? 1 : -1;
+            return 0;
+        });
+        rows.forEach(r => tbody.appendChild(r));
+    }
+}
+</script>
+
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>vLLM Regression Comparison</h1>
+            <div>Generated: 2026-01-16 07:00</div>
+            <div class="subline">New run: 20260116_124824 (/scratch/mgehre/regression-results/regression_20260116_124824.json)</div>
+            <div class="subline">Baseline: 20260115_145036 (/scratch/mgehre/regression-results/regression_20260115_145036.json)</div>
+        </div>
+        <div class="note mono">Δ = % change (positive = faster)</div>
+        <div class="stats">
+            <div class="stat total"><div class="stat-value">16</div><div>Matched tests</div></div>
+            <div class="stat passed"><div class="stat-value">16</div><div>New run PASS</div></div>
+            <div class="stat failed"><div class="stat-value">0</div><div>New run FAIL/ERR/TO</div></div>
+            <div class="stat delta-better"><div class="stat-value">0</div><div>Decode faster</div></div>
+            <div class="stat delta-worse"><div class="stat-value">2</div><div>Decode slower</div></div>
+            <div class="stat delta-better"><div class="stat-value">15</div><div>Prefill faster</div></div>
+            <div class="stat delta-worse"><div class="stat-value">1</div><div>Prefill slower</div></div>
+        </div>
+        <table id="comparison-table">
+            <thead>
+                <tr>
+                    <th data-type="str">Test Name</th>
+                    <th data-type="str">Status (new)</th>
+                    <th data-type="num">Baseline Decode [tok/s] (TPOT)</th>
+                    <th data-type="num">New Decode [tok/s] (TPOT)</th>
+                    <th data-type="num">Decode Δ</th>
+                    <th data-type="num">Roofline [tok/s]</th>
+                    <th data-type="num">% Roofline</th>
+                    <th data-type="num" class="section-start">Baseline Prefill [tok/s] (TTFT)</th>
+                    <th data-type="num">New Prefill [tok/s] (TTFT)</th>
+                    <th data-type="num">Prefill Δ</th>
+                    <th data-type="num" class="section-start">Input Len</th>
+                    <th data-type="num">Output Len</th>
+                    <th data-type="str">Model</th>
+                </tr>
+            </thead>
+            <tbody><tr><td>Gemma-2B_128</td><td><span class="status-pass">PASS</span></td><td class="mono">82 (12.2 ms)</td><td class="mono">82 (12.2 ms)</td><td class="delta-same">-0%</td><td class="mono">121.3</td><td class="mono">68%</td><td class="mono section-start">1189 (108 ms)</td><td class="mono">1734 (74 ms)</td><td class="delta-better">+46%</td><td class="section-start">128</td><td>128</td><td>google/gemma-2b-AWQ</td></tr><tr><td>Gemma-2B_8000</td><td><span class="status-pass">PASS</span></td><td class="mono">73 (13.6 ms)</td><td class="mono">73 (13.6 ms)</td><td class="delta-same">+0%</td><td class="mono">113.4</td><td class="mono">65%</td><td class="mono section-start">2025 (3950 ms)</td><td class="mono">2487 (3217 ms)</td><td class="delta-better">+23%</td><td class="section-start">8000</td><td>128</td><td>google/gemma-2b-AWQ</td></tr><tr><td>Llama-2-7B-AWQ_128</td><td><span class="status-pass">PASS</span></td><td class="mono">51 (19.6 ms)</td><td class="mono">52 (19.4 ms)</td><td class="delta-same">+1%</td><td class="mono">68.3</td><td class="mono">76%</td><td class="mono section-start">459 (279 ms)</td><td class="mono">707 (181 ms)</td><td class="delta-better">+54%</td><td class="section-start">128</td><td>128</td><td>TheBloke/Llama-2-7B-AWQ</td></tr><tr><td>Llama-2-7B-AWQ_1920</td><td><span class="status-pass">PASS</span></td><td class="mono">41 (24.1 ms)</td><td class="mono">41 (24.2 ms)</td><td class="delta-same">-0%</td><td class="mono">54.5</td><td class="mono">76%</td><td class="mono section-start">1237 (1553 ms)</td><td class="mono">1349 (1423 ms)</td><td class="delta-better">+9%</td><td class="section-start">1920</td><td>128</td><td>TheBloke/Llama-2-7B-AWQ</td></tr><tr><td>Qwen2.5-0.5B-Instruct_128</td><td><span class="status-pass">PASS</span></td><td class="mono">203 (4.9 ms)</td><td class="mono">201 (5.0 ms)</td><td class="delta-same">-1%</td><td class="mono">548.7</td><td class="mono">37%</td><td class="mono section-start">3471 (37 ms)</td><td class="mono">6767 (19 ms)</td><td class="delta-better">+95%</td><td class="section-start">128</td><td>128</td><td>Qwen/Qwen2.5-0.5B-Instruct-AWQ</td></tr><tr><td>Qwen2.5-0.5B-Instruct_3968</td><td><span class="status-pass">PASS</span></td><td class="mono">189 (5.3 ms)</td><td class="mono">185 (5.4 ms)</td><td class="delta-worse">-2%</td><td class="mono">497.6</td><td class="mono">37%</td><td class="mono section-start">19098 (208 ms)</td><td class="mono">20303 (195 ms)</td><td class="delta-better">+6%</td><td class="section-start">3968</td><td>128</td><td>Qwen/Qwen2.5-0.5B-Instruct-AWQ</td></tr><tr><td>Qwen2.5-3B-Instruct_128</td><td><span class="status-pass">PASS</span></td><td class="mono">78 (12.9 ms)</td><td class="mono">78 (12.8 ms)</td><td class="delta-same">+1%</td><td class="mono">122.0</td><td class="mono">64%</td><td class="mono section-start">860 (149 ms)</td><td class="mono">1413 (91 ms)</td><td class="delta-better">+64%</td><td class="section-start">128</td><td>128</td><td>Qwen/Qwen2.5-3B-Instruct-AWQ</td></tr><tr><td>Qwen2.5-3B-Instruct_3968</td><td><span class="status-pass">PASS</span></td><td class="mono">74 (13.5 ms)</td><td class="mono">74 (13.5 ms)</td><td class="delta-same">+1%</td><td class="mono">114.1</td><td class="mono">65%</td><td class="mono section-start">2246 (1767 ms)</td><td class="mono">2987 (1329 ms)</td><td class="delta-better">+33%</td><td class="section-start">3968</td><td>128</td><td>Qwen/Qwen2.5-3B-Instruct-AWQ</td></tr><tr><td>Qwen2.5-7B-Instruct_128</td><td><span class="status-pass">PASS</span></td><td class="mono">44 (22.9 ms)</td><td class="mono">44 (22.9 ms)</td><td class="delta-same">+0%</td><td class="mono">56.2</td><td class="mono">78%</td><td class="mono section-start">415 (308 ms)</td><td class="mono">694 (185 ms)</td><td class="delta-better">+67%</td><td class="section-start">128</td><td>128</td><td>Qwen/Qwen2.5-7B-Instruct-AWQ</td></tr><tr><td>Qwen2.5-7B-Instruct_3968</td><td><span class="status-pass">PASS</span></td><td class="mono">42 (23.9 ms)</td><td class="mono">42 (24.1 ms)</td><td class="delta-same">-1%</td><td class="mono">53.6</td><td class="mono">77%</td><td class="mono section-start">983 (4037 ms)</td><td class="mono">1081 (3671 ms)</td><td class="delta-better">+10%</td><td class="section-start">3968</td><td>128</td><td>Qwen/Qwen2.5-7B-Instruct-AWQ</td></tr><tr><td>Qwen3-1.7B_128</td><td><span class="status-pass">PASS</span></td><td class="mono">112 (8.9 ms)</td><td class="mono">112 (8.9 ms)</td><td class="delta-same">-0%</td><td class="mono">337.7</td><td class="mono">33%</td><td class="mono section-start">1611 (79 ms)</td><td class="mono">2229 (57 ms)</td><td class="delta-better">+38%</td><td class="section-start">128</td><td>128</td><td>Orion-zhen/Qwen3-1.7B-AWQ</td></tr><tr><td>Qwen3-1.7B_3968</td><td><span class="status-pass">PASS</span></td><td class="mono">93 (10.8 ms)</td><td class="mono">93 (10.8 ms)</td><td class="delta-same">+1%</td><td class="mono">212.5</td><td class="mono">44%</td><td class="mono section-start">4219 (941 ms)</td><td class="mono">4941 (803 ms)</td><td class="delta-better">+17%</td><td class="section-start">3968</td><td>128</td><td>Orion-zhen/Qwen3-1.7B-AWQ</td></tr><tr><td>Qwen3-4B_128</td><td><span class="status-pass">PASS</span></td><td class="mono">69 (14.5 ms)</td><td class="mono">69 (14.6 ms)</td><td class="delta-same">-0%</td><td class="mono">132.3</td><td class="mono">52%</td><td class="mono section-start">736 (174 ms)</td><td class="mono">1178 (109 ms)</td><td class="delta-better">+60%</td><td class="section-start">128</td><td>128</td><td>Qwen/Qwen3-4B-AWQ</td></tr><tr><td>Qwen3-4B_3968</td><td><span class="status-pass">PASS</span></td><td class="mono">59 (17.0 ms)</td><td class="mono">57 (17.6 ms)</td><td class="delta-worse">-4%</td><td class="mono">102.0</td><td class="mono">56%</td><td class="mono section-start">2032 (1953 ms)</td><td class="mono">1880 (2111 ms)</td><td class="delta-worse">-7%</td><td class="section-start">3968</td><td>128</td><td>Qwen/Qwen3-4B-AWQ</td></tr><tr><td>SmolLM2-1.7B-Instruct-AWQ_128</td><td><span class="status-pass">PASS</span></td><td class="mono">111 (9.0 ms)</td><td class="mono">110 (9.1 ms)</td><td class="delta-same">-1%</td><td class="mono">263.8</td><td class="mono">42%</td><td class="mono section-start">1470 (87 ms)</td><td class="mono">2239 (57 ms)</td><td class="delta-better">+52%</td><td class="section-start">128</td><td>128</td><td>trymirai/SmolLM2-1.7B-Instruct-AWQ</td></tr><tr><td>SmolLM2-1.7B-Instruct-AWQ_8000</td><td><span class="status-pass">PASS</span></td><td class="mono">63 (15.9 ms)</td><td class="mono">63 (15.9 ms)</td><td class="delta-same">+0%</td><td class="mono">100.8</td><td class="mono">63%</td><td class="mono section-start">4096 (1953 ms)</td><td class="mono">4756 (1682 ms)</td><td class="delta-better">+16%</td><td class="section-start">8000</td><td>128</td><td>trymirai/SmolLM2-1.7B-Instruct-AWQ</td></tr></tbody>
+        </table>
+    </div>
+    <script>makeTableSortable('comparison-table');</script>
+</body>
+</html>
