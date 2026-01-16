@@ -56,6 +56,31 @@ jobs:
           pip install torch torchvision --index-url ${{ env.PYTORCH_INDEX_URL }}
           python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
 
+      - name: Configure ROCm environment
+        id: rocm-env
+        run: |
+          # Get site-packages path
+          SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
+          echo "SITE_PACKAGES=$SITE_PACKAGES"
+          
+          # Set ROCm paths based on AMD nightly wheel structure
+          ROCM_PATH="$SITE_PACKAGES/_rocm_sdk_devel"
+          HIP_DEVICE_LIB_PATH="$SITE_PACKAGES/_rocm_sdk_core/lib/llvm/amdgcn/bitcode"
+          ROCM_BIN="$ROCM_PATH/bin"
+          
+          # Verify paths exist
+          ls -la "$ROCM_PATH" || echo "Warning: ROCM_PATH not found"
+          ls -la "$HIP_DEVICE_LIB_PATH" || echo "Warning: HIP_DEVICE_LIB_PATH not found"
+          
+          # Export to GITHUB_ENV for subsequent steps
+          echo "ROCM_PATH=$ROCM_PATH" >> $GITHUB_ENV
+          echo "HIP_DEVICE_LIB_PATH=$HIP_DEVICE_LIB_PATH" >> $GITHUB_ENV
+          echo "PATH=$ROCM_BIN:$PATH" >> $GITHUB_ENV
+          
+          # Verify hipcc is available
+          which hipcc || echo "hipcc not found in PATH"
+          hipcc --version || echo "hipcc version check failed"
+
       - name: Install vLLM build requirements
         run: |
           pip install -r requirements/build.txt || true
@@ -66,6 +91,9 @@ jobs:
           PYTORCH_ROCM_ARCH: ${{ env.PYTORCH_ROCM_ARCH }}
           MAX_JOBS: 4
         run: |
+          echo "ROCM_PATH=$ROCM_PATH"
+          echo "HIP_DEVICE_LIB_PATH=$HIP_DEVICE_LIB_PATH"
+          echo "PYTORCH_ROCM_ARCH=$PYTORCH_ROCM_ARCH"
           python setup.py bdist_wheel --dist-dir=dist
           ls -la dist/
 
