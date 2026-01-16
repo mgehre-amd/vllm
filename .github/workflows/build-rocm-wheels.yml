@@ -32,6 +32,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0  # Full history for setuptools-scm versioning
+          fetch-tags: true  # Fetch all tags for proper version calculation
 
       - name: Free disk space
         run: |
