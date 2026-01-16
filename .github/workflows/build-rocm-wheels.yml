@@ -6,6 +6,7 @@ on:
       - 'v*'
     branches:
       - main
+      - 'matthias.awq_gemv'
       - 'release/*'
   workflow_dispatch:
     inputs:
