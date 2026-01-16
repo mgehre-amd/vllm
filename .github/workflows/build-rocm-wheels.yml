@@ -1,0 +1,259 @@
+name: Build ROCm Wheels
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+      - 'release/*'
+  workflow_dispatch:
+    inputs:
+      pytorch_index:
+        description: 'PyTorch index URL for ROCm nightly wheels'
+        default: 'https://rocm.nightlies.amd.com/v2-staging/gfx1151'
+        required: false
+      rocm_arch:
+        description: 'ROCm architecture (e.g., gfx1151, gfx1150;gfx1151)'
+        default: 'gfx1151'
+        required: false
+
+env:
+  PYTORCH_INDEX_URL: ${{ github.event.inputs.pytorch_index || 'https://rocm.nightlies.amd.com/v2-staging/gfx1151' }}
+  PYTORCH_ROCM_ARCH: ${{ github.event.inputs.rocm_arch || 'gfx1151' }}
+
+jobs:
+  build-wheel:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for setuptools-scm versioning
+
+      - name: Free disk space
+        run: |
+          # Free up disk space for the build
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          df -h
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build wheel setuptools setuptools-scm ninja cmake packaging jinja2
+
+      - name: Install PyTorch from ROCm nightly
+        run: |
+          pip install torch torchvision --index-url ${{ env.PYTORCH_INDEX_URL }}
+          python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+
+      - name: Install vLLM build requirements
+        run: |
+          pip install -r requirements/build.txt || true
+          pip install -r requirements/common.txt || true
+
+      - name: Build wheel
+        env:
+          PYTORCH_ROCM_ARCH: ${{ env.PYTORCH_ROCM_ARCH }}
+          MAX_JOBS: 4
+        run: |
+          python setup.py bdist_wheel --dist-dir=dist
+          ls -la dist/
+
+      - name: Rename wheel for manylinux compliance
+        run: |
+          cd dist
+          for wheel in *.whl; do
+            if [[ "$wheel" == *"linux"* ]]; then
+              new_name="${wheel/linux/manylinux_2_31}"
+              mv "$wheel" "$new_name"
+              echo "Renamed $wheel to $new_name"
+            fi
+          done
+          ls -la
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-rocm-wheel
+          path: dist/*.whl
+          retention-days: 90
+
+      - name: Generate wheel index
+        run: |
+          python scripts/generate-wheel-index.py \
+            --wheels-dir dist \
+            --output-dir gh-pages \
+            --base-url "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/wheels"
+
+      - name: Upload index artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-index
+          path: gh-pages/
+          retention-days: 90
+
+  publish-to-gh-pages:
+    needs: build-wheel
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+    
+    steps:
+      - name: Checkout gh-pages branch
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages-existing
+        continue-on-error: true
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vllm-rocm-wheel
+          path: new-wheels/
+
+      - name: Download index artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-index
+          path: new-index/
+
+      - name: Prepare gh-pages content
+        run: |
+          # Create wheels directory structure
+          mkdir -p gh-pages/wheels
+          
+          # Copy existing wheels if gh-pages branch exists
+          if [ -d "gh-pages-existing/wheels" ]; then
+            cp -r gh-pages-existing/wheels/* gh-pages/wheels/ 2>/dev/null || true
+          fi
+          
+          # Copy new wheels
+          cp new-wheels/*.whl gh-pages/wheels/
+          
+          # List all wheels and regenerate index
+          ls -la gh-pages/wheels/
+
+      - name: Regenerate complete index
+        run: |
+          pip install regex
+          
+          cat > /tmp/generate_index.py << 'EOF'
+          import os
+          import sys
+          from pathlib import Path
+          from datetime import datetime
+          
+          INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
+          <html>
+            <head><title>vLLM ROCm Wheels</title></head>
+            <body>
+              <h1>vLLM ROCm Wheels</h1>
+              <p>Generated: {timestamp}</p>
+              <p>Install with: <code>pip install vllm --extra-index-url {base_url}</code></p>
+              <h2>Packages</h2>
+          {items}
+            </body>
+          </html>
+          """
+          
+          PACKAGE_INDEX_TEMPLATE = """<!DOCTYPE html>
+          <html>
+            <head><title>vllm</title></head>
+            <body>
+              <h1>vllm</h1>
+          {items}
+            </body>
+          </html>
+          """
+          
+          wheels_dir = Path("gh-pages/wheels")
+          wheels_dir.mkdir(parents=True, exist_ok=True)
+          
+          # Find all wheel files
+          wheel_files = list(wheels_dir.glob("*.whl"))
+          
+          # Create vllm package directory
+          vllm_dir = wheels_dir / "vllm"
+          vllm_dir.mkdir(exist_ok=True)
+          
+          # Generate package index with links to wheels
+          wheel_links = []
+          for whl in sorted(wheel_files, key=lambda x: x.name, reverse=True):
+              # Link points to parent directory where wheels are stored
+              wheel_links.append(f'    <a href="../{whl.name}">{whl.name}</a><br/>')
+          
+          package_index = PACKAGE_INDEX_TEMPLATE.format(items="\n".join(wheel_links))
+          (vllm_dir / "index.html").write_text(package_index)
+          
+          # Generate top-level index
+          base_url = os.environ.get("BASE_URL", "https://example.github.io/vllm/wheels")
+          top_index = INDEX_HTML_TEMPLATE.format(
+              timestamp=datetime.now().isoformat(),
+              base_url=base_url,
+              items='    <a href="vllm/">vllm</a><br/>'
+          )
+          (wheels_dir / "index.html").write_text(top_index)
+          
+          print(f"Generated index with {len(wheel_files)} wheels")
+          EOF
+          
+          BASE_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/wheels" \
+            python /tmp/generate_index.py
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./gh-pages
+          keep_files: true
+
+  create-release:
+    needs: build-wheel
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vllm-rocm-wheel
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          body: |
+            ## vLLM ROCm Wheel
+            
+            Built for ROCm architecture: `${{ env.PYTORCH_ROCM_ARCH }}`
+            
+            ### Installation
+            
+            **Option 1: Direct wheel install**
+            ```bash
+            pip install ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/<wheel-filename>.whl
+            ```
+            
+            **Option 2: Using extra index URL**
+            ```bash
+            pip install vllm --extra-index-url https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/wheels
+            ```
+            
+            **Note:** You also need ROCm PyTorch. Install it first:
+            ```bash
+            pip install torch --index-url ${{ env.PYTORCH_INDEX_URL }}
+            ```
