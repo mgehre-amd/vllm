@@ -5,6 +5,7 @@
 
 import os
 
+os.environ["VLLM_USE_TRITON_AWQ"] = "1"
 os.environ["VLLM_USE_TRITON_AWQ_GEMV"] = "1"
 
 import argparse
@@ -333,6 +334,12 @@ def main():
         help="Run exhaustive search for optimal GEMV configs",
     )
     parser.add_argument(
+        "--framework",
+        choices=["old", "new"],
+        default="new",
+        help="Select benchmark framework: old=AWQ path, new=HipW4A16 W4A16 path",
+    )
+    parser.add_argument(
         "--gemm-tuning", action="store_true", help="Run exhaustive GEMM tuning for M>1"
     )
     parser.add_argument(
@@ -425,6 +432,7 @@ def main():
         (22016, 4096, 128),  # gate_up_proj (11008 * 2)
         (4096, 11008, 128),  # down_proj
         # Additional test shapes
+        (8, 128, 128),
         (6144, 2560, 128),
         (2560, 4096, 128),
         (19456, 9728, 128),
@@ -1100,6 +1108,619 @@ def main():
 
         return results
 
+    def run_new_hip_kernel_benchmark(shapes):
+        """Benchmark HipW4A16LinearKernel via mixed-precision selector."""
+
+        def ensure_single_process_model_parallel():
+            import torch.distributed as dist
+
+            from vllm.distributed.parallel_state import (
+                ensure_model_parallel_initialized,
+                init_distributed_environment,
+                model_parallel_is_initialized,
+            )
+
+            if not dist.is_initialized():
+                init_method = f"file:///tmp/vllm_dist_{os.getpid()}"
+                init_distributed_environment(
+                    world_size=1,
+                    rank=0,
+                    local_rank=0,
+                    distributed_init_method=init_method,
+                    backend="gloo",
+                )
+            if not model_parallel_is_initialized():
+                ensure_model_parallel_initialized(1, 1)
+
+        ensure_single_process_model_parallel()
+        from vllm.model_executor.layers.quantization.kernels.mixed_precision import (
+            MPLinearLayerConfig,
+            choose_mp_linear_kernel,
+        )
+        from vllm.model_executor.parameter import (
+            GroupQuantScaleParameter,
+            PackedvLLMParameter,
+        )
+        from vllm.scalar_type import scalar_types
+
+        print("\n" + "=" * 130)
+        print("BENCHMARK RESULTS (Mixed-Precision AWQ Kernel)")
+        print("=" * 130)
+        print(
+            f"{'N':>6} x {'K':<6} | {'G':>4} | {'Padded':>14}"
+            f" | {'Kernel':<24} | {'GB/s':>10} | {'Time':>10}"
+            f" | {'% Peak':>10} | {'vs Ref':>10}"
+        )
+        print("-" * 130)
+
+        regressions = []
+        results = []
+        for N, K, group_size in shapes:
+            if K % group_size != 0:
+                continue
+            if group_size != 128:
+                continue
+
+            pack_factor = 8
+            num_groups = K // group_size
+
+            mp_config = MPLinearLayerConfig(
+                full_weight_shape=(K, N),
+                partition_weight_shape=(K, N),
+                weight_type=scalar_types.uint4,
+                act_type=torch.float16,
+                group_size=group_size,
+                zero_points=True,
+                has_g_idx=False,
+            )
+            try:
+                kernel_type = choose_mp_linear_kernel(mp_config)
+            except Exception as exc:  # pragma: no cover - debug guard
+                print(f"{N:>6} x {K:<6} | {group_size:>4} | ERROR: {exc}")
+                continue
+
+            w_q_packed = torch.randint(
+                -(2**31),
+                2**31,
+                (N, K // pack_factor),
+                dtype=torch.int32,
+                device="cuda",
+            )
+            w_zp_packed = torch.randint(
+                -(2**31),
+                2**31,
+                (N // pack_factor, num_groups),
+                dtype=torch.int32,
+                device="cuda",
+            )
+            w_s_data = (
+                torch.randn(N, num_groups, dtype=torch.float16, device="cuda") * 0.01
+            )
+            x = torch.randn(1, K, dtype=torch.float16, device="cuda") * 0.01
+
+            layer = torch.nn.Module()
+            weight_loader = lambda *_args, **_kwargs: None
+
+            # inputs laid out according to CompressedTensorsWNA16.create_weights()
+            w_q = PackedvLLMParameter(
+                input_dim=1,
+                output_dim=0,
+                packed_dim=1,
+                packed_factor=pack_factor,
+                weight_loader=weight_loader,
+                data=w_q_packed,
+            )
+            w_s = GroupQuantScaleParameter(
+                output_dim=0,
+                input_dim=1,
+                weight_loader=weight_loader,
+                data=w_s_data,
+            )
+            w_zp = PackedvLLMParameter(
+                input_dim=1,
+                output_dim=0,
+                packed_dim=0,
+                packed_factor=pack_factor,
+                weight_loader=weight_loader,
+                data=w_zp_packed,
+            )
+
+            layer.register_parameter("weight_packed", w_q)
+            layer.register_parameter("weight_scale", w_s)
+            layer.register_parameter("weight_zero_point", w_zp)
+
+            kernel = kernel_type(
+                mp_config,
+                w_q_param_name="weight_packed",
+                w_s_param_name="weight_scale",
+                w_zp_param_name="weight_zero_point",
+            )
+            kernel.process_weights_after_loading(layer)
+
+            w_q_processed, _, _, _ = kernel._get_weight_params(layer)
+            padded_k = w_q_processed.shape[0]
+
+            # Pad the activations so that our benchmark measures
+            # mostly the GPU kernel, not the time spent padding.
+            # TODO: This gives a consistent comparison versus the
+            # legacy implementation, but it doesn't help us tune the
+            # padding conditions in HipW4A16LinearKernel.  Should we
+            # add a script option to let the kernel do the padding
+            # each time?
+            x_bench = x
+            if padded_k != K:
+                x_padded = torch.zeros(
+                    (x.shape[0], padded_k),
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+                x_padded[:, : x.shape[1]] = x
+                x_bench = x_padded
+
+            def run_kernel(_kernel=kernel, _layer=layer, _x=x_bench):
+                return _kernel.apply_weights(_layer, _x)
+
+            ms = bench(run_kernel, warmup=args.warmup, rep=args.rep)
+            bytes_moved = calculate_bytes(K, N, group_size, M)
+            bw = bytes_moved / (ms * GIB_DIVISOR)
+            pct_peak = bw / PEAK_BW * 100
+            padded_str = f"{K}->{padded_k}" if padded_k != K else "-"
+
+            shape_key = (N, K, group_size)
+            ref_perf = BEST_KNOWN_PERF.get(shape_key)
+            if ref_perf is not None:
+                ratio = bw / ref_perf
+                threshold = 1.0 - PERF_TOLERANCE
+                if ratio < threshold:
+                    vs_ref = f"SLOW {ratio * 100:.0f}%"
+                    regressions.append((N, K, group_size, bw, ref_perf, ratio))
+                elif ratio > 1.0 + PERF_TOLERANCE:
+                    vs_ref = f"NEW! {ratio * 100:.0f}%"
+                else:
+                    vs_ref = "OK"
+            else:
+                vs_ref = "no ref"
+
+            print(
+                f"{N:>6} x {K:<6} | {group_size:>4}"
+                f" | {padded_str:>14}"
+                f" | {kernel_type.__name__:<24}"
+                f" | {bw:>10.1f} | {ms * 1000:>8.0f} us"
+                f" | {pct_peak:>9.1f}% | {vs_ref:>10}"
+            )
+            results.append((K, N, group_size, bw, ms))
+
+        print("-" * 130)
+
+        if regressions:
+            print("\n⚠️  PERFORMANCE REGRESSIONS DETECTED:")
+            print("-" * 70)
+            for N, K, G, actual, expected, ratio in regressions:
+                print(
+                    f"  {N}x{K} G={G}: {actual:.1f} GB/s"
+                    f" vs {expected:.1f} GB/s expected"
+                    f" ({ratio * 100:.0f}%)"
+                )
+            print("-" * 70)
+            print(
+                f"  Tolerance: {PERF_TOLERANCE * 100:.0f}%"
+                f" (values below"
+                f" {100 - PERF_TOLERANCE * 100:.0f}%"
+                f" of reference trigger warning)"
+            )
+        return results
+
+    def run_new_hip_kernel_correctness_test(shapes):
+        """Correctness test for mixed-precision kernel via selected backend."""
+
+        def ensure_single_process_model_parallel():
+            import torch.distributed as dist
+
+            from vllm.distributed.parallel_state import (
+                ensure_model_parallel_initialized,
+                init_distributed_environment,
+                model_parallel_is_initialized,
+            )
+
+            if not dist.is_initialized():
+                init_method = f"file:///tmp/vllm_dist_{os.getpid()}"
+                init_distributed_environment(
+                    world_size=1,
+                    rank=0,
+                    local_rank=0,
+                    distributed_init_method=init_method,
+                    backend="gloo",
+                )
+            if not model_parallel_is_initialized():
+                ensure_model_parallel_initialized(1, 1)
+
+        ensure_single_process_model_parallel()
+        from vllm.model_executor.layers.quantization.kernels.mixed_precision import (
+            MPLinearLayerConfig,
+            choose_mp_linear_kernel,
+        )
+        from vllm.model_executor.layers.quantization.kernels.mixed_precision.hip_w4a16 import (  # noqa: E501
+            HipW4A16LinearKernel,
+        )
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            pack_quantized_values_into_int32,
+            unpack_quantized_values_into_int32,
+        )
+        from vllm.model_executor.parameter import (
+            GroupQuantScaleParameter,
+            PackedvLLMParameter,
+        )
+        from vllm.scalar_type import scalar_types
+
+        print("\n" + "=" * 110)
+        print("HIP W4A16 CORRECTNESS TEST")
+        print("=" * 110)
+        print(
+            f"{'N':>6} x {'K':<6} | {'G':>4}"
+            f" | {'Pattern':<8} | {'Ker':<3}"
+            f" | {'Max Diff':>10} | {'Rel Err':>10}"
+            f" | {'Status':>8}"
+        )
+        print("-" * 110)
+
+        all_pass = True
+        all_expected = True
+        for N, K, group_size in shapes:
+            if group_size != 128 or K % group_size != 0:
+                continue
+
+            pack_factor = 8
+            num_groups = K // group_size
+
+            mp_config = MPLinearLayerConfig(
+                full_weight_shape=(K, N),
+                partition_weight_shape=(K, N),
+                weight_type=scalar_types.uint4,
+                act_type=torch.float16,
+                group_size=group_size,
+                zero_points=True,
+                has_g_idx=False,
+            )
+            try:
+                kernel_type = choose_mp_linear_kernel(mp_config)
+            except Exception as exc:  # pragma: no cover - debug guard
+                print(f"{N:>6} x {K:<6} | {group_size:>4} | ERROR: {exc}")
+                all_pass = False
+                continue
+
+            # We test correctness of whichever kernel is selected.
+            # Testing the correctness of an alternative known-good
+            # kernel checks the reference computations in this script.
+            # If it's not HipW4A16, we mark it "unexpected" to avoid
+            # benchmarking afterward, since we don't care about that.
+            if kernel_type is not HipW4A16LinearKernel:
+                all_expected = False
+
+            kernel = kernel_type(
+                mp_config,
+                w_q_param_name="weight_packed",
+                w_s_param_name="weight_scale",
+                w_zp_param_name="weight_zero_point",
+            )
+
+            for pattern_name in [
+                "ones",
+                "random",
+                "zero_x",
+                "zero_s",
+                "zero_w",
+                "last_row",
+                "last_col",
+            ]:
+                if pattern_name == "random":
+                    w_q_packed = torch.randint(
+                        -(2**31),
+                        2**31,
+                        (N, K // pack_factor),
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+                    w_zp_packed = torch.randint(
+                        -(2**31),
+                        2**31,
+                        (N // pack_factor, num_groups),
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+                    w_s_data = (
+                        torch.randn(N, num_groups, dtype=torch.float16) * 0.01
+                    ).cuda()
+                    x = torch.randn(M, K, dtype=torch.float16, device="cuda") * 0.01
+                elif pattern_name == "ones":
+                    # weight == (q-z) == 1, scale == 1;
+                    # catches missing contributions
+                    z_val = torch.randint(
+                        0, 15, (1,), dtype=torch.int32, device="cuda"
+                    ).item()
+                    q_val = z_val + 1
+
+                    unpacked = torch.full(
+                        (1, pack_factor), q_val, dtype=torch.int32, device="cuda"
+                    )
+                    packed = int(
+                        pack_quantized_values_into_int32(
+                            unpacked, scalar_types.uint4, packed_dim=1
+                        ).item()
+                    )
+                    w_q_packed = torch.full(
+                        (N, K // pack_factor), packed, dtype=torch.int32, device="cuda"
+                    )
+
+                    unpacked = torch.full(
+                        (1, pack_factor), z_val, dtype=torch.int32, device="cuda"
+                    )
+                    packed = int(
+                        pack_quantized_values_into_int32(
+                            unpacked, scalar_types.uint4, packed_dim=1
+                        ).item()
+                    )
+                    w_zp_packed = torch.full(
+                        (N // pack_factor, num_groups),
+                        packed,
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+
+                    w_s_data = torch.ones(
+                        (N, num_groups), dtype=torch.float16, device="cuda"
+                    )
+                    x = torch.randn(M, K, dtype=torch.float16, device="cuda") * 0.01
+                elif pattern_name == "zero_x":
+                    w_q_packed = torch.randint(
+                        -(2**31),
+                        2**31,
+                        (N, K // pack_factor),
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+                    w_zp_packed = torch.randint(
+                        -(2**31),
+                        2**31,
+                        (N // pack_factor, num_groups),
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+                    w_s_data = (
+                        torch.randn(N, num_groups, dtype=torch.float16) * 0.01
+                    ).cuda()
+                    x = torch.zeros(M, K, dtype=torch.float16, device="cuda")
+                elif pattern_name == "zero_s":
+                    w_q_packed = torch.randint(
+                        -(2**31),
+                        2**31,
+                        (N, K // pack_factor),
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+                    w_zp_packed = torch.randint(
+                        -(2**31),
+                        2**31,
+                        (N // pack_factor, num_groups),
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+                    w_s_data = torch.zeros(
+                        N, num_groups, dtype=torch.float16, device="cuda"
+                    )
+                    x = torch.randn(M, K, dtype=torch.float16, device="cuda") * 0.01
+                elif pattern_name == "zero_w":
+                    # weight == (q - z) == 0
+                    z_val = torch.randint(
+                        0, 16, (1,), dtype=torch.int32, device="cuda"
+                    ).item()
+                    q_val = z_val
+
+                    unpacked = torch.full(
+                        (1, pack_factor), q_val, dtype=torch.int32, device="cuda"
+                    )
+                    packed = int(
+                        pack_quantized_values_into_int32(
+                            unpacked, scalar_types.uint4, packed_dim=1
+                        ).item()
+                    )
+                    w_q_packed = torch.full(
+                        (N, K // pack_factor), packed, dtype=torch.int32, device="cuda"
+                    )
+
+                    unpacked = torch.full(
+                        (1, pack_factor), z_val, dtype=torch.int32, device="cuda"
+                    )
+                    packed = int(
+                        pack_quantized_values_into_int32(
+                            unpacked, scalar_types.uint4, packed_dim=1
+                        ).item()
+                    )
+                    w_zp_packed = torch.full(
+                        (N // pack_factor, num_groups),
+                        packed,
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+
+                    w_s_data = (
+                        torch.randn(N, num_groups, dtype=torch.float16) * 0.01
+                    ).cuda()
+                    x = torch.randn(M, K, dtype=torch.float16, device="cuda") * 0.01
+                elif pattern_name == "last_row":
+                    # Only the last input row contributes.
+                    w_q_packed = torch.randint(
+                        -(2**31),
+                        2**31,
+                        (N, K // pack_factor),
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+                    w_zp_packed = torch.randint(
+                        -(2**31),
+                        2**31,
+                        (N // pack_factor, num_groups),
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+                    w_s_data = (
+                        torch.randn(N, num_groups, dtype=torch.float16) * 0.01
+                    ).cuda()
+                    x = torch.zeros(M, K, dtype=torch.float16, device="cuda")
+                    x[:, -1] = 1.0
+                elif pattern_name == "last_col":
+                    # Only the last output column has non-zero weights.
+                    w_unpacked = torch.zeros((N, K), dtype=torch.int32, device="cuda")
+                    w_unpacked[-1, :] = 1
+                    w_q_packed = pack_quantized_values_into_int32(
+                        w_unpacked, scalar_types.uint4, packed_dim=1
+                    )
+                    w_zp_packed = torch.zeros(
+                        (N // pack_factor, num_groups), dtype=torch.int32, device="cuda"
+                    )
+                    w_s_data = torch.ones(
+                        (N, num_groups), dtype=torch.float16, device="cuda"
+                    )
+                    x = torch.randn(M, K, dtype=torch.float16, device="cuda") * 0.01
+                else:
+                    raise AssertionError(f"Unknown pattern: {pattern_name}")
+
+                def compute_expected_output(
+                    _wq=w_q_packed,
+                    _wz=w_zp_packed,
+                    _ws=w_s_data,
+                    _x=x,
+                    _K=K,
+                    _N=N,
+                    _ng=num_groups,
+                    _gs=group_size,
+                ):
+                    weights = unpack_quantized_values_into_int32(
+                        _wq, scalar_types.uint4, packed_dim=1
+                    ).to(torch.float32)
+                    if weights.shape == (_N, _K):
+                        weights = weights.t()
+                    if weights.shape != (_K, _N):
+                        raise ValueError(
+                            f"Unexpected unpacked weight shape: {tuple(weights.shape)}"
+                        )
+
+                    zeros = unpack_quantized_values_into_int32(
+                        _wz, scalar_types.uint4, packed_dim=0
+                    ).to(torch.float32)
+                    if zeros.shape == (_N, _ng):
+                        zeros = zeros.t()
+                    if zeros.shape != (_ng, _N):
+                        raise ValueError(f"Unexpected zero shape: {tuple(zeros.shape)}")
+
+                    scales = _ws.to(torch.float32)
+                    if scales.shape == (_N, _ng):
+                        scales = scales.t()
+                    if scales.shape != (_ng, _N):
+                        raise ValueError(
+                            f"Unexpected scale shape: {tuple(scales.shape)}"
+                        )
+
+                    zeros_exp = zeros.repeat_interleave(_gs, dim=0)
+                    scales_exp = scales.repeat_interleave(_gs, dim=0)
+                    dequant = (weights - zeros_exp) * scales_exp
+                    y_ref = _x.to(torch.float32) @ dequant
+                    return y_ref
+
+                y_ref = compute_expected_output()
+
+                layer = torch.nn.Module()
+                weight_loader = lambda *_args, **_kwargs: None
+
+                # inputs laid out according to CompressedTensorsWNA16.create_weights()
+                w_q = PackedvLLMParameter(
+                    input_dim=1,
+                    output_dim=0,
+                    packed_dim=1,
+                    packed_factor=pack_factor,
+                    weight_loader=weight_loader,
+                    data=w_q_packed,
+                )
+                w_s = GroupQuantScaleParameter(
+                    output_dim=0,
+                    input_dim=1,
+                    weight_loader=weight_loader,
+                    data=w_s_data,
+                )
+                w_zp = PackedvLLMParameter(
+                    input_dim=1,
+                    output_dim=0,
+                    packed_dim=0,
+                    packed_factor=pack_factor,
+                    weight_loader=weight_loader,
+                    data=w_zp_packed,
+                )
+
+                layer.register_parameter("weight_packed", w_q)
+                layer.register_parameter("weight_scale", w_s)
+                layer.register_parameter("weight_zero_point", w_zp)
+
+                # The kernel is expected to pad these as needed.
+                assert layer.weight_packed.shape == (N, K // pack_factor), (
+                    "Don't pad weights when testing correctness."
+                )
+                assert layer.weight_scale.shape == (N, num_groups), (
+                    "Don't pad scales when testing correctness."
+                )
+                assert layer.weight_zero_point.shape == (
+                    N // pack_factor,
+                    num_groups,
+                ), "Don't pad zeros when testing correctness."
+                kernel.process_weights_after_loading(layer)
+
+                try:
+                    # The kernel is expected to pad as needed.
+                    assert x.shape == (M, K), (
+                        "Don't pad activations when testing correctness."
+                    )
+                    y = kernel.apply_weights(layer, x)
+                except Exception as exc:  # pragma: no cover - debug guard
+                    print(
+                        f"{N:>6} x {K:<6}"
+                        f" | {group_size:>4}"
+                        f" | {pattern_name:<8}"
+                        f" | ERROR: {exc}"
+                    )
+                    all_pass = False
+                    continue
+
+                if pattern_name in ("zero_s", "zero_w") and not torch.all(y == 0):
+                    print(
+                        f"{N:>6} x {K:<6}"
+                        f" | {group_size:>4}"
+                        f" | {pattern_name:<8}"
+                        " | ERROR: expected all-zero output"
+                    )
+                    all_pass = False
+
+                diff = (y.to(torch.float32) - y_ref).abs()
+                max_diff = diff.max().item()
+                denom = y_ref.abs().max().item()
+                rel_err = max_diff / max(denom, 1e-6)
+                passed = rel_err < 0.01
+                status = "PASS" if passed else "FAIL"
+                if not passed:
+                    all_pass = False
+
+                print(
+                    f"{N:>6} x {K:<6} | {group_size:>4}"
+                    f" | {pattern_name:<8}"
+                    f" | {kernel_type.__name__[:3]:<3}"
+                    f" | {max_diff:>10.4f}"
+                    f" | {rel_err:>9.2%} | {status:>8}"
+                )
+
+        print("-" * 110)
+        print(
+            "Correctness summary: "
+            f"output_ok={all_pass}, expected_kernel_ok={all_expected}"
+        )
+        return all_pass and all_expected
+
     def run_exhaustive_search(shapes):
         """Run exhaustive search for optimal configurations."""
         if M > 1:
@@ -1462,6 +2083,15 @@ Based on benchmarking, consider these changes for Strix Halo:
                 " be valid."
             )
 
+    # To streamline correctness tests, cover only the smallest shape defined for each K.
+    correctness_test_shapes = sorted(SHAPES, key=lambda shape: shape[0] * shape[1])
+    seen_k = set()
+    correctness_test_shapes = [
+        shape
+        for shape in correctness_test_shapes
+        if (shape[1] not in seen_k and not seen_k.add(shape[1]))
+    ]
+
     # Run tests
     if args.gemm_quick:
         run_gemm_tuning(SHAPES, quick=True)
@@ -1470,20 +2100,33 @@ Based on benchmarking, consider these changes for Strix Halo:
     elif args.exhaustive:
         run_exhaustive_search(SHAPES)
     elif args.correctness_only:
-        run_correctness_test(SHAPES)
+        if args.framework == "new":
+            run_new_hip_kernel_correctness_test(correctness_test_shapes)
+        else:
+            run_correctness_test(correctness_test_shapes)
     elif args.benchmark_only:
-        run_benchmark(
-            SHAPES, include_autoawq=args.autoawq, autoawq_module=autoawq_module
-        )
-    else:
-        # Run both
-        passed = run_correctness_test(SHAPES)
-        if passed:
+        if args.framework == "new":
+            run_new_hip_kernel_benchmark(SHAPES)
+        else:
             run_benchmark(
                 SHAPES, include_autoawq=args.autoawq, autoawq_module=autoawq_module
             )
+    else:
+        # Run both
+        if args.framework == "new":
+            passed = run_new_hip_kernel_correctness_test(correctness_test_shapes)
+            if passed:
+                run_new_hip_kernel_benchmark(correctness_test_shapes)
+            else:
+                print("\nSkipping benchmark due to correctness failures")
         else:
-            print("\nSkipping benchmark due to correctness failures")
+            passed = run_correctness_test(SHAPES)
+            if passed:
+                run_benchmark(
+                    SHAPES, include_autoawq=args.autoawq, autoawq_module=autoawq_module
+                )
+            else:
+                print("\nSkipping benchmark due to correctness failures")
 
     print("\n" + "=" * 100)
     print("SUMMARY")

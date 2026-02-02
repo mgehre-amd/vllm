@@ -20,6 +20,20 @@
   #undef NDEBUG
   #include <cassert>
 
+enum class PackingOrder {
+  // vals[0] at bits [3:0], vals[1] at bits [7:4]
+  // vals[2] at bits [11:8], vals[3] at bits [15:12]
+  // vals[4] at bits [19:16], vals[5] at bits [23:20]
+  // vals[6] at bits [27:24], vals[7] at bits [31:28]
+  LINEAR = 0,
+
+  // vals[0] at bits [3:0], vals[1] at bits [19:16]
+  // vals[2] at bits [7:4], vals[3] at bits [23:20]
+  // vals[4] at bits [11:8], vals[5] at bits [27:24]
+  // vals[6] at bits [15:12], vals[7] at bits [31:28]
+  AWQ,
+};
+
 // ============================================================================
 // FP16 bit-trick dequantization helpers
 // Reinterpret a uint32 as a pair of fp16 values (__half2) via union cast.
@@ -46,7 +60,7 @@ static constexpr uint32_t FP16_1024_PAIR = 0x64006400u;
 // AWQ GEMV Kernel with Split-K parallelism
 // Accumulates in fp32 for precision, supports SPLIT_K = 1, 2, 4, 8, 16
 // ============================================================================
-template <int OUTPUT_PER_THREAD, int SPLIT_K>
+template <int OUTPUT_PER_THREAD, int SPLIT_K, PackingOrder PACKING>
 __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
     const __half* __restrict__ activation,  // [K]
     const uint32_t* __restrict__ qweight,   // [K, N/8]
@@ -66,6 +80,30 @@ __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
   constexpr int UINT32_PER_LOAD = OUTPUT_PER_THREAD / 8;  // 1
   constexpr int PIPELINE_DEPTH = 16;
   constexpr int ACC_HALF2_COUNT = OUTPUT_PER_THREAD / 2;  // 4
+
+  // In a packed input word, this is the base shift for items 0, 2, 4, and 6.
+  constexpr int PACKED_BIT_SHIFT_0 = 0;
+
+  // In a packed input word, this is the base shift for items 1, 3, 5, and 7.
+  constexpr int PACKED_BIT_SHIFT_1 = [] {
+    switch (PACKING) {
+      case PackingOrder::AWQ:
+        return 16;
+      case PackingOrder::LINEAR:
+        return 4;
+    }
+  }();
+
+  // In a packed input word, this is the shift between subsequent items of the
+  // same stripe, e.g., between items 0 and 2, or between items 3 and 5.
+  constexpr int PACKED_BIT_STRIDE = [] {
+    switch (PACKING) {
+      case PackingOrder::AWQ:
+        return 4;
+      case PackingOrder::LINEAR:
+        return 8;
+    }
+  }();
 
   // Runtime number of groups and iterations per group
   size_t TOTAL_GROUPS = K / G;
@@ -176,16 +214,32 @@ __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
   #define EXTRACT_ZEROS_IN_BUF_SK(buf_idx)                          \
     do {                                                            \
       _Pragma("unroll") for (int j = 0; j < UINT32_PER_LOAD; j++) { \
-        uint32_t za = packed_zeros[buf_idx][j];                     \
-        zeros2[buf_idx][j * 4 + 0] =                                \
-            uint32_as_half2((za & 0x000f000fu) | FP16_1024_PAIR);   \
-        zeros2[buf_idx][j * 4 + 1] =                                \
-            uint32_as_half2((za & 0x00f000f0u) | FP16_1024_PAIR);   \
-        za >>= 8;                                                   \
-        zeros2[buf_idx][j * 4 + 2] =                                \
-            uint32_as_half2((za & 0x000f000fu) | FP16_1024_PAIR);   \
-        zeros2[buf_idx][j * 4 + 3] =                                \
-            uint32_as_half2((za & 0x00f000f0u) | FP16_1024_PAIR);   \
+        if constexpr (PACKING == PackingOrder::AWQ) {               \
+          uint32_t za = packed_zeros[buf_idx][j];                   \
+          zeros2[buf_idx][j * 4 + 0] =                              \
+              uint32_as_half2((za & 0x000f000fu) | FP16_1024_PAIR); \
+          zeros2[buf_idx][j * 4 + 1] =                              \
+              uint32_as_half2((za & 0x00f000f0u) | FP16_1024_PAIR); \
+          za >>= 8;                                                 \
+          zeros2[buf_idx][j * 4 + 2] =                              \
+              uint32_as_half2((za & 0x000f000fu) | FP16_1024_PAIR); \
+          zeros2[buf_idx][j * 4 + 3] =                              \
+              uint32_as_half2((za & 0x00f000f0u) | FP16_1024_PAIR); \
+        } else { /* TODO: optimize using AWQ techniques? */         \
+          static_assert(PACKING == PackingOrder::LINEAR);           \
+          _Pragma("unroll") for (int b = 0; b < 4; b++) {           \
+            uint16_t zero0 = static_cast<uint16_t>(                 \
+                (packed_zeros[buf_idx][j] >>                        \
+                 (b * PACKED_BIT_STRIDE + PACKED_BIT_SHIFT_0)) &    \
+                0xF);                                               \
+            uint16_t zero1 = static_cast<uint16_t>(                 \
+                (packed_zeros[buf_idx][j] >>                        \
+                 (b * PACKED_BIT_STRIDE + PACKED_BIT_SHIFT_1)) &    \
+                0xF);                                               \
+            zeros2[buf_idx][j * 4 + b] = __halves2half2(            \
+                __ushort2half_rn(zero0), __ushort2half_rn(zero1));  \
+          }                                                         \
+        }                                                           \
       }                                                             \
     } while (0)
 
@@ -210,51 +264,81 @@ __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
       __half act_val = ((slot) % 2 == 0) ? __low2half(a2) : __high2half(a2);   \
       float act_f = __half2float(act_val);                                     \
       _Pragma("unroll") for (int j = 0; j < UINT32_PER_LOAD; j++) {            \
-        uint32_t qa = w[slot][j];                                              \
-        /* Pair 0: low nibble → elements 0,1 */                                \
-        {                                                                      \
-          __half2 w_h2 = uint32_as_half2((qa & 0x000f000fu) | FP16_1024_PAIR); \
-          __half2 diff = __hsub2(w_h2, zeros2[curr_buf][j * 4 + 0]);           \
-          __half2 s2 = scales2[curr_buf][j * 4 + 0];                           \
-          float d0 = __half2float(__low2half(diff));                           \
-          float d1 = __half2float(__high2half(diff));                          \
-          acc[(j * 4 + 0) * 2] += act_f * d0 * __half2float(__low2half(s2));   \
-          acc[(j * 4 + 0) * 2 + 1] +=                                          \
-              act_f * d1 * __half2float(__high2half(s2));                      \
-        }                                                                      \
-        /* Pair 1: high nibble → elements 2,3 (has ×16, corrected) */          \
-        {                                                                      \
-          __half2 w_h2 = uint32_as_half2((qa & 0x00f000f0u) | FP16_1024_PAIR); \
-          __half2 diff = __hsub2(w_h2, zeros2[curr_buf][j * 4 + 1]);           \
-          __half2 s2 = scales2[curr_buf][j * 4 + 1];                           \
-          float d0 = __half2float(__low2half(diff)) * 0.0625f;                 \
-          float d1 = __half2float(__high2half(diff)) * 0.0625f;                \
-          acc[(j * 4 + 1) * 2] += act_f * d0 * __half2float(__low2half(s2));   \
-          acc[(j * 4 + 1) * 2 + 1] +=                                          \
-              act_f * d1 * __half2float(__high2half(s2));                      \
-        }                                                                      \
-        qa >>= 8;                                                              \
-        /* Pair 2: low nibble → elements 4,5 */                                \
-        {                                                                      \
-          __half2 w_h2 = uint32_as_half2((qa & 0x000f000fu) | FP16_1024_PAIR); \
-          __half2 diff = __hsub2(w_h2, zeros2[curr_buf][j * 4 + 2]);           \
-          __half2 s2 = scales2[curr_buf][j * 4 + 2];                           \
-          float d0 = __half2float(__low2half(diff));                           \
-          float d1 = __half2float(__high2half(diff));                          \
-          acc[(j * 4 + 2) * 2] += act_f * d0 * __half2float(__low2half(s2));   \
-          acc[(j * 4 + 2) * 2 + 1] +=                                          \
-              act_f * d1 * __half2float(__high2half(s2));                      \
-        }                                                                      \
-        /* Pair 3: high nibble → elements 6,7 (has ×16, corrected) */          \
-        {                                                                      \
-          __half2 w_h2 = uint32_as_half2((qa & 0x00f000f0u) | FP16_1024_PAIR); \
-          __half2 diff = __hsub2(w_h2, zeros2[curr_buf][j * 4 + 3]);           \
-          __half2 s2 = scales2[curr_buf][j * 4 + 3];                           \
-          float d0 = __half2float(__low2half(diff)) * 0.0625f;                 \
-          float d1 = __half2float(__high2half(diff)) * 0.0625f;                \
-          acc[(j * 4 + 3) * 2] += act_f * d0 * __half2float(__low2half(s2));   \
-          acc[(j * 4 + 3) * 2 + 1] +=                                          \
-              act_f * d1 * __half2float(__high2half(s2));                      \
+        if constexpr (PACKING == PackingOrder::AWQ) {                          \
+          uint32_t qa = w[slot][j];                                            \
+          /* Pair 0: low nibble → elements 0,1 */                              \
+          {                                                                    \
+            __half2 w_h2 =                                                     \
+                uint32_as_half2((qa & 0x000f000fu) | FP16_1024_PAIR);          \
+            __half2 diff = __hsub2(w_h2, zeros2[curr_buf][j * 4 + 0]);         \
+            __half2 s2 = scales2[curr_buf][j * 4 + 0];                         \
+            float d0 = __half2float(__low2half(diff));                         \
+            float d1 = __half2float(__high2half(diff));                        \
+            acc[(j * 4 + 0) * 2] += act_f * d0 * __half2float(__low2half(s2)); \
+            acc[(j * 4 + 0) * 2 + 1] +=                                        \
+                act_f * d1 * __half2float(__high2half(s2));                    \
+          }                                                                    \
+          /* Pair 1: high nibble → elements 2,3 (has ×16, corrected) */        \
+          {                                                                    \
+            __half2 w_h2 =                                                     \
+                uint32_as_half2((qa & 0x00f000f0u) | FP16_1024_PAIR);          \
+            __half2 diff = __hsub2(w_h2, zeros2[curr_buf][j * 4 + 1]);         \
+            __half2 s2 = scales2[curr_buf][j * 4 + 1];                         \
+            float d0 = __half2float(__low2half(diff)) * 0.0625f;               \
+            float d1 = __half2float(__high2half(diff)) * 0.0625f;              \
+            acc[(j * 4 + 1) * 2] += act_f * d0 * __half2float(__low2half(s2)); \
+            acc[(j * 4 + 1) * 2 + 1] +=                                        \
+                act_f * d1 * __half2float(__high2half(s2));                    \
+          }                                                                    \
+          qa >>= 8;                                                            \
+          /* Pair 2: low nibble → elements 4,5 */                              \
+          {                                                                    \
+            __half2 w_h2 =                                                     \
+                uint32_as_half2((qa & 0x000f000fu) | FP16_1024_PAIR);          \
+            __half2 diff = __hsub2(w_h2, zeros2[curr_buf][j * 4 + 2]);         \
+            __half2 s2 = scales2[curr_buf][j * 4 + 2];                         \
+            float d0 = __half2float(__low2half(diff));                         \
+            float d1 = __half2float(__high2half(diff));                        \
+            acc[(j * 4 + 2) * 2] += act_f * d0 * __half2float(__low2half(s2)); \
+            acc[(j * 4 + 2) * 2 + 1] +=                                        \
+                act_f * d1 * __half2float(__high2half(s2));                    \
+          }                                                                    \
+          /* Pair 3: high nibble → elements 6,7 (has ×16, corrected) */        \
+          {                                                                    \
+            __half2 w_h2 =                                                     \
+                uint32_as_half2((qa & 0x00f000f0u) | FP16_1024_PAIR);          \
+            __half2 diff = __hsub2(w_h2, zeros2[curr_buf][j * 4 + 3]);         \
+            __half2 s2 = scales2[curr_buf][j * 4 + 3];                         \
+            float d0 = __half2float(__low2half(diff)) * 0.0625f;               \
+            float d1 = __half2float(__high2half(diff)) * 0.0625f;              \
+            acc[(j * 4 + 3) * 2] += act_f * d0 * __half2float(__low2half(s2)); \
+            acc[(j * 4 + 3) * 2 + 1] +=                                        \
+                act_f * d1 * __half2float(__high2half(s2));                    \
+          }                                                                    \
+        } else { /* TODO: optimize using AWQ techniques? */                    \
+          static_assert(PACKING == PackingOrder::LINEAR);                      \
+          _Pragma("unroll") for (int b = 0; b < 4; b++) {                      \
+            uint16_t w0 = static_cast<uint16_t>(                               \
+                (w[slot][j] >> (b * PACKED_BIT_STRIDE + PACKED_BIT_SHIFT_0)) & \
+                0xF);                                                          \
+            uint16_t w1 = static_cast<uint16_t>(                               \
+                (w[slot][j] >> (b * PACKED_BIT_STRIDE + PACKED_BIT_SHIFT_1)) & \
+                0xF);                                                          \
+            __half2 weight2 =                                                  \
+                __halves2half2(__ushort2half_rn(w0), __ushort2half_rn(w1));    \
+            /* dequant = (weight - zero) * scale in fp32 */                    \
+            __half2 z2 = zeros2[curr_buf][j * 4 + b];                          \
+            __half2 s2 = scales2[curr_buf][j * 4 + b];                         \
+            float dequant0 = (__half2float(__low2half(weight2)) -              \
+                              __half2float(__low2half(z2))) *                  \
+                             __half2float(__low2half(s2));                     \
+            float dequant1 = (__half2float(__high2half(weight2)) -             \
+                              __half2float(__high2half(z2))) *                 \
+                             __half2float(__high2half(s2));                    \
+            /* acc += activation * dequant in fp32 */                          \
+            acc[(j * 4 + b) * 2] += act_f * dequant0;                          \
+            acc[(j * 4 + b) * 2 + 1] += act_f * dequant1;                      \
+          }                                                                    \
         }                                                                      \
       }                                                                        \
     } while (0)
@@ -471,12 +555,12 @@ __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
   }
 }
 
-// PyTorch binding wrapper
-torch::Tensor awq_gemv_hip(torch::Tensor activation,  // [M, K] or [K]
-                           torch::Tensor qweight,     // [K, N/8]
-                           torch::Tensor scales,      // [K/G, N]
-                           torch::Tensor qzeros,      // [K/G, N/8]
-                           int64_t split_k)           // 0=auto, 1/2/4/8/16
+template <PackingOrder PACKING>
+torch::Tensor awq_gemv_hip_impl(torch::Tensor activation,  // [M, K] or [K]
+                                torch::Tensor qweight,     // [K, N/8]
+                                torch::Tensor scales,      // [K/G, N]
+                                torch::Tensor qzeros,      // [K/G, N/8]
+                                int64_t split_k)           // 0=auto, 1/2/4/8/16
 {
   // ========== Dimension checks ==========
   TORCH_CHECK(qweight.dim() == 2, "qweight must be 2D, got ", qweight.dim(),
@@ -631,7 +715,7 @@ torch::Tensor awq_gemv_hip(torch::Tensor activation,  // [M, K] or [K]
                                            OUTPUT_PER_THREAD * sizeof(float)
                                      : 0;
 
-    awq_gemv_kernel_splitk<8, SPLIT_K>
+    awq_gemv_kernel_splitk<8, SPLIT_K, PACKING>
         <<<num_blocks, THREADS_PER_BLOCK, smem_size, stream>>>(
             reinterpret_cast<const __half*>(act_flat.data_ptr<at::Half>()),
             reinterpret_cast<const uint32_t*>(qweight.data_ptr<int32_t>()),
@@ -708,5 +792,16 @@ torch::Tensor awq_gemv_hip(torch::Tensor activation,  // [M, K] or [K]
 
   return output;
 }
+
+// PyTorch binding wrapper
+torch::Tensor awq_gemv_hip(torch::Tensor activation,  // [M, K] or [K]
+                           torch::Tensor qweight,     // [K, N/8]
+                           torch::Tensor scales,      // [K/G, N]
+                           torch::Tensor qzeros,      // [K/G, N/8]
+                           int64_t split_k)           // 0=auto, 1/2/4/8/16
+{
+  return awq_gemv_hip_impl<PackingOrder::AWQ>(activation, qweight, scales,
+                                              qzeros, split_k);
+};
 
 #endif  // USE_ROCM
