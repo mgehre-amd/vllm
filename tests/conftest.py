@@ -21,6 +21,7 @@ import json
 import math
 import mimetypes
 import os
+import secrets
 import socket
 import tempfile
 import threading
@@ -1350,6 +1351,21 @@ def pytest_addoption(parser):
     parser.addoption(
         "--optional", action="store_true", default=False, help="run optional test"
     )
+    parser.addoption(
+        "--random-seed",
+        metavar="num",
+        action="store",
+        type=int,
+        default=1000 + secrets.randbelow(9000),
+        help="random seed for tests that opt in",
+    )
+
+
+def pytest_report_header(config):
+    seed = config.getoption("--random-seed")
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER")
+    worker_suffix = f" ({worker_id})" if worker_id else ""
+    return f"random seed{worker_suffix}: {seed}"
 
 
 def pytest_collection_modifyitems(config, items):
@@ -1360,6 +1376,11 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "optional" in item.keywords:
             item.add_marker(skip_optional)
+
+
+@pytest.fixture(scope="session")
+def random_seed(pytestconfig: pytest.Config) -> int:
+    return pytestconfig.getoption("--random-seed")
 
 
 @pytest.fixture(scope="session")
