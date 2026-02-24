@@ -59,6 +59,28 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "                     Tensor? maybe_expert_map) -> () ");
   m.impl("moe_lora_align_block_size", torch::kCUDA, &moe_lora_align_block_size);
 
+  m.def(
+      "moe_permute(Tensor input, Tensor topk_ids,"
+      "Tensor token_expert_indices, Tensor? expert_map, int n_expert,"
+      "int n_local_expert,"
+      "int topk, Tensor! permuted_input, Tensor! "
+      "expert_first_token_offset, Tensor! inv_permuted_idx, Tensor! "
+      "permuted_idx)->()");
+
+  m.def(
+      "moe_unpermute(Tensor permuted_hidden_states, Tensor topk_weights,"
+      "Tensor inv_permuted_idx, Tensor? expert_first_token_offset, "
+      "int topk, Tensor! hidden_states)->()");
+
+  m.def("moe_permute_unpermute_supported() -> bool");
+  m.impl("moe_permute_unpermute_supported", &moe_permute_unpermute_supported);
+
+  // Row shuffle for MoE
+  m.def(
+      "shuffle_rows(Tensor input_tensor, Tensor dst2src_map, Tensor! "
+      "output_tensor) -> ()");
+  m.impl("shuffle_rows", torch::kCUDA, &shuffle_rows);
+
 #ifndef USE_ROCM
   m.def(
       "moe_wna16_gemm(Tensor input, Tensor! output, Tensor b_qweight, "
@@ -94,28 +116,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "topk, "
       "int moe_block_size, bool replicate_input, bool apply_weights)"
       " -> Tensor");
-
-  m.def(
-      "moe_permute(Tensor input, Tensor topk_ids,"
-      "Tensor token_expert_indices, Tensor? expert_map, int n_expert,"
-      "int n_local_expert,"
-      "int topk, Tensor! permuted_input, Tensor! "
-      "expert_first_token_offset, Tensor! inv_permuted_idx, Tensor! "
-      "permuted_idx)->()");
-
-  m.def(
-      "moe_unpermute(Tensor permuted_hidden_states, Tensor topk_weights,"
-      "Tensor inv_permuted_idx, Tensor? expert_first_token_offset, "
-      "int topk, Tensor! hidden_states)->()");
-
-  m.def("moe_permute_unpermute_supported() -> bool");
-  m.impl("moe_permute_unpermute_supported", &moe_permute_unpermute_supported);
-
-  // Row shuffle for MoE
-  m.def(
-      "shuffle_rows(Tensor input_tensor, Tensor dst2src_map, Tensor! "
-      "output_tensor) -> ()");
-  m.impl("shuffle_rows", torch::kCUDA, &shuffle_rows);
 
   // Apply grouped topk routing to select experts.
   m.def(

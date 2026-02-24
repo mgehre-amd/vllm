@@ -5,11 +5,119 @@
 #include <c10/core/ScalarType.h>
 #include <torch/all.h>
 #include "dispatch.h"
-#include <cub/cub.cuh>
-#include <cub/device/device_radix_sort.cuh>
-#include <cub/util_type.cuh>
-#include "cutlass/numeric_size.h"
-#include "cutlass/array.h"
+
+#ifdef USE_ROCM
+  #include <hip/hip_runtime.h>
+  #include <hipcub/hipcub.hpp>
+#else
+  #include <cub/cub.cuh>
+  #include <cub/device/device_radix_sort.cuh>
+  #include <cub/util_type.cuh>
+#endif
+
+// ============================================================================
+// cutlass replacements for ROCm (cutlass is not available on HIP)
+// ============================================================================
+#ifdef USE_ROCM
+
+namespace cutlass {
+
+// Drop in replacement for cutlass::Array with the only strictily required
+// methods
+template <typename T, int N>
+struct Array {
+  static constexpr int kElements = N;
+  using Element = T;
+  T storage[N];
+
+  __host__ __device__ T& operator[](int i) { return storage[i]; }
+  __host__ __device__ const T& operator[](int i) const { return storage[i]; }
+
+  __host__ __device__ void fill(T val) {
+  #pragma unroll
+    for (int i = 0; i < N; ++i) storage[i] = val;
+  }
+
+  __host__ __device__ Array operator+(const Array& rhs) const {
+    Array result;
+  #pragma unroll
+    for (int i = 0; i < N; ++i) result[i] = storage[i] + rhs[i];
+    return result;
+  }
+};
+
+template <typename T, int N>
+__host__ __device__ Array<T, N> operator*(T scalar, const Array<T, N>& arr) {
+  Array<T, N> result;
+  #pragma unroll
+  for (int i = 0; i < N; ++i) result[i] = scalar * arr[i];
+  return result;
+}
+
+template <typename T>
+struct sizeof_bits {
+  static constexpr int value = sizeof(T) * 8;
+};
+
+template <>
+struct sizeof_bits<hip_bfloat16> {
+  static constexpr int value = 16;
+};
+
+}  // namespace cutlass
+
+// Type conversion helpers for ROCm (where __HIP_NO_HALF_CONVERSIONS__ is set)
+template <typename To, typename From>
+__host__ __device__ inline To rocm_moe_convert(From val) {
+  return static_cast<To>(val);
+}
+
+template <>
+__host__ __device__ inline float rocm_moe_convert<float, __half>(__half val) {
+  return __half2float(val);
+}
+
+template <>
+__host__ __device__ inline __half rocm_moe_convert<__half, float>(float val) {
+  return __float2half(val);
+}
+
+template <>
+__host__ __device__ inline float rocm_moe_convert<float, __hip_fp8_e4m3>(
+    __hip_fp8_e4m3 val) {
+  __half_raw hr = __hip_cvt_fp8_to_halfraw(val.__x, __HIP_E4M3);
+  return rocm_moe_convert<float, __half>(__half(hr));
+}
+
+template <>
+__host__ __device__ inline __hip_fp8_e4m3
+rocm_moe_convert<__hip_fp8_e4m3, float>(float val) {
+  __hip_fp8_e4m3 result;
+  result.__x = __hip_cvt_float_to_fp8(val, __HIP_SATFINITE, __HIP_E4M3);
+  return result;
+}
+
+template <>
+__host__ __device__ inline float rocm_moe_convert<float, __hip_fp8_e5m2>(
+    __hip_fp8_e5m2 val) {
+  __half_raw hr = __hip_cvt_fp8_to_halfraw(val.__x, __HIP_E5M2);
+  return rocm_moe_convert<float, __half>(__half(hr));
+}
+
+template <>
+__host__ __device__ inline __hip_fp8_e5m2
+rocm_moe_convert<__hip_fp8_e5m2, float>(float val) {
+  __hip_fp8_e5m2 result;
+  result.__x = __hip_cvt_float_to_fp8(val, __HIP_SATFINITE, __HIP_E5M2);
+  return result;
+}
+
+#else  // !USE_ROCM
+
+  #include "cutlass/numeric_size.h"
+  #include "cutlass/array.h"
+
+#endif  // USE_ROCM
 
 template <typename T>
 inline T* get_ptr(torch::Tensor& t) {

@@ -52,6 +52,7 @@ if __name__ == "__main__":
 
     hipify_result = hipify(
         project_directory=args.project_dir,
+        extensions=(".cu", ".cuh", ".c", ".cc", ".cpp", ".h", ".in", ".hpp", ".inl"),
         output_directory=args.output_dir,
         header_include_dirs=[],
         includes=includes,

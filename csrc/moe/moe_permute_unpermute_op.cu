@@ -5,8 +5,8 @@
 #include "permute_unpermute_kernels/dispatch.h"
 #include "core/registration.h"
 
-// moe_permute kernels require at least CUDA 12.0
-#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12000)
+// moe_permute kernels require at least CUDA 12.0, or ROCm/HIP
+#if (defined(CUDA_VERSION) && (CUDA_VERSION >= 12000)) || defined(USE_ROCM)
 
 void moe_permute(
     const torch::Tensor& input,                      // [n_token, hidden]
@@ -188,10 +188,16 @@ void moe_unpermute(
   TORCH_CHECK(false, "moe_unpermute is not supported on CUDA < 12.0");
 }
 
+void shuffle_rows(const torch::Tensor& input_tensor,
+                  const torch::Tensor& dst2src_map,
+                  torch::Tensor& output_tensor) {
+  TORCH_CHECK(false, "shuffle_rows is not supported on CUDA < 12.0");
+}
+
 #endif
 
 bool moe_permute_unpermute_supported() {
-#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12000)
+#if (defined(CUDA_VERSION) && (CUDA_VERSION >= 12000)) || defined(USE_ROCM)
   return true;
 #else
   return false;

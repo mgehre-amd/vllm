@@ -1,8 +1,8 @@
 
 #include "moe_permute_unpermute_kernel.h"
 
-// moe_permute kernels require at least CUDA 12.0
-#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12000)
+// moe_permute kernels require at least CUDA 12.0, or ROCm/HIP
+#if (defined(CUDA_VERSION) && (CUDA_VERSION >= 12000)) || defined(USE_ROCM)
 
 // CubKeyValueSorter definition begin
 CubKeyValueSorter::CubKeyValueSorter()

@@ -16,7 +16,6 @@ __global__ void expandInputRowsKernel(
   int64_t expanded_dest_row = blockIdx.x;
   int64_t const expanded_source_row =
       expanded_dest_row_to_expanded_source_row[expanded_dest_row];
-  int expert_id = sorted_experts[expanded_dest_row];
 
   if (threadIdx.x == 0) {
     assert(expanded_dest_row <= INT32_MAX);
@@ -81,11 +80,16 @@ void expandInputRowsKernelLauncher(
 template <class T, class U>
 __host__ __device__ constexpr static U arrayConvert(T const& input) {
   using Type = typename U::Element;
+  using FromType = typename T::Element;
   static_assert(T::kElements == U::kElements);
   U u;
 #pragma unroll
   for (int i = 0; i < U::kElements; i++) {
+#ifdef USE_ROCM
+    u[i] = rocm_moe_convert<Type, FromType>(input[i]);
+#else
     u[i] = static_cast<Type>(input[i]);
+#endif
   }
   return u;
 }

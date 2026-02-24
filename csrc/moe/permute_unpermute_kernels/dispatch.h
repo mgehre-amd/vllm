@@ -1,5 +1,11 @@
 #pragma once
-#include <cuda_fp8.h>
+
+#ifdef USE_ROCM
+  #include <hip/hip_fp8.h>
+#else
+  #include <cuda_fp8.h>
+#endif
+
 #define MOE_SWITCH(TYPE, ...)                                     \
   at::ScalarType _st = ::detail::scalar_type(TYPE);               \
   switch (_st) {                                                  \
@@ -38,22 +44,29 @@ struct ScalarType2CudaType<at::ScalarType::Half> {
 };
 template <>
 struct ScalarType2CudaType<at::ScalarType::BFloat16> {
+#ifdef USE_ROCM
+  using type = hip_bfloat16;
+#else
   using type = __nv_bfloat16;
+#endif
 };
-// uint8 for packed fp4
 template <>
 struct ScalarType2CudaType<at::ScalarType::Byte> {
   using type = uint8_t;
 };
-
-// #if __CUDA_ARCH__ >= 890
-// fp8
 template <>
 struct ScalarType2CudaType<at::ScalarType::Float8_e5m2> {
+#ifdef USE_ROCM
+  using type = __hip_fp8_e5m2;
+#else
   using type = __nv_fp8_e5m2;
+#endif
 };
 template <>
 struct ScalarType2CudaType<at::ScalarType::Float8_e4m3fn> {
+#ifdef USE_ROCM
+  using type = __hip_fp8_e4m3;
+#else
   using type = __nv_fp8_e4m3;
+#endif
 };
-// #endif
