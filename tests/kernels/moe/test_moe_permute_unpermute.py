@@ -16,19 +16,12 @@ from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
     moe_permute_unpermute_supported,
     moe_unpermute,
 )
-from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
 NUM_EXPERTS = [16, 64, 256]
 TOP_KS = [2, 6, 8]
 EP_SIZE = [1, 4, 16]
 set_random_seed(0)
-
-if current_platform.is_rocm():
-    pytest.skip(
-        "moe_permute_unpermute_supported is not defined for ROCm",
-        allow_module_level=True,
-    )
 
 
 def torch_permute(
