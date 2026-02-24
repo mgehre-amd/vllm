@@ -122,14 +122,23 @@ def _make_exllama_moe_weights(
     return w_packed, w_scales, qzeros, w_ref
 
 
-@pytest.mark.skipif(
-    not (current_platform.is_rocm() or current_platform.is_cuda()),
-    reason="Requires ROCm or CUDA",
-)
-@pytest.mark.parametrize("m", [1, 4, 16])
-@pytest.mark.parametrize("n,k", [(256, 256), (512, 256)])
-@pytest.mark.parametrize("e,topk", [(8, 2), (16, 4)])
-def test_exllama_moe(m: int, n: int, k: int, e: int, topk: int):
+def _run_exllama_moe(
+    m: int,
+    n: int,
+    k: int,
+    e: int,
+    topk: int,
+    force_block_size_m: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build weights, run ExllamaExperts and torch_experts reference.
+
+    Args:
+        force_block_size_m: If set, override ``_select_block_size_m`` to always
+            return this value.  Useful for explicitly exercising the contiguous
+            kernel path (block_size_m > 1) regardless of the token count.
+
+    Returns (exllama_output, reference_output).
+    """
     torch.cuda.manual_seed(1)
     device = torch.device("cuda")
     group_size = GROUP_SIZE
@@ -167,35 +176,86 @@ def test_exllama_moe(m: int, n: int, k: int, e: int, topk: int):
         in_dtype=torch.float16,
     )
 
-    mk = FusedMoEModularKernel(
-        fused_experts=ExllamaExperts(
-            moe_config=moe_config,
-            quant_config=quant_config,
-        ),
-        prepare_finalize=MoEPrepareAndFinalizeNoEP(),
+    experts = ExllamaExperts(
+        moe_config=moe_config,
+        quant_config=quant_config,
     )
 
-    init_workspace_manager(device)
-    vllm_config = VllmConfig()
-    with set_current_vllm_config(vllm_config):
-        torch_output = torch_experts(
-            hidden,
-            w1_ref,
-            w2_ref,
-            topk_weight=topk_weights,
-            topk_ids=topk_ids,
-            global_num_experts=e,
+    orig_select = None
+    if force_block_size_m is not None:
+        orig_select = ExllamaExperts._select_block_size_m
+        forced = force_block_size_m
+        ExllamaExperts._select_block_size_m = staticmethod(lambda _m, _t, _e: forced)
+
+    try:
+        mk = FusedMoEModularKernel(
+            fused_experts=experts,
+            prepare_finalize=MoEPrepareAndFinalizeNoEP(),
         )
 
-        exllama_out = mk(
-            hidden_states=hidden,
-            w1=w1_packed,
-            w2=w2_packed,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            global_num_experts=e,
-            expert_map=None,
-            activation=MoEActivation.SILU,
-        )
+        init_workspace_manager(device)
+        vllm_config = VllmConfig()
+        with set_current_vllm_config(vllm_config):
+            torch_output = torch_experts(
+                hidden,
+                w1_ref,
+                w2_ref,
+                topk_weight=topk_weights,
+                topk_ids=topk_ids,
+                global_num_experts=e,
+            )
 
+            exllama_out = mk(
+                hidden_states=hidden,
+                w1=w1_packed,
+                w2=w2_packed,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                global_num_experts=e,
+                expert_map=None,
+                activation=MoEActivation.SILU,
+            )
+    finally:
+        if orig_select is not None:
+            ExllamaExperts._select_block_size_m = orig_select
+
+    return exllama_out, torch_output
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() or current_platform.is_cuda()),
+    reason="Requires ROCm or CUDA",
+)
+@pytest.mark.parametrize("m", [1, 4, 16])
+@pytest.mark.parametrize("n,k", [(256, 256), (512, 256)])
+@pytest.mark.parametrize("e,topk", [(8, 2), (16, 4)])
+def test_exllama_moe(m: int, n: int, k: int, e: int, topk: int):
+    exllama_out, torch_output = _run_exllama_moe(m, n, k, e, topk)
+    torch.testing.assert_close(exllama_out, torch_output, atol=2e-2, rtol=0)
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() or current_platform.is_cuda()),
+    reason="Requires ROCm or CUDA",
+)
+@pytest.mark.parametrize("m", [1, 4, 16])
+@pytest.mark.parametrize("n,k", [(256, 256), (512, 256)])
+@pytest.mark.parametrize("e,topk", [(8, 2), (16, 4)])
+def test_exllama_moe_contiguous(
+    m: int,
+    n: int,
+    k: int,
+    e: int,
+    topk: int,
+):
+    """Force block_size_m=2 to exercise the contiguous kernel + scatter_add_
+    reduction path for all token counts, including m=1."""
+    exllama_out, torch_output = _run_exllama_moe(
+        m,
+        n,
+        k,
+        e,
+        topk,
+        force_block_size_m=2,
+    )
     torch.testing.assert_close(exllama_out, torch_output, atol=2e-2, rtol=0)
