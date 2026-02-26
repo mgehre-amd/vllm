@@ -28,6 +28,9 @@ class ExllamaLinearKernel(MPLinearKernel):
 
     @classmethod
     def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
+        ok, err = cls._validate_config_invariants(c)
+        if not ok:
+            return False, err
         if not current_platform.is_cuda_alike():
             return (
                 False,
@@ -72,6 +75,7 @@ class ExllamaLinearKernel(MPLinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        self._validate_layer_invariants(layer)
         c = self.config
 
         # For Exllama, we need to set a zero-point tensor if there is not one

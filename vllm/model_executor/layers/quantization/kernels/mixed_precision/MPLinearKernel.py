@@ -53,6 +53,26 @@ class MPLinearKernel(ABC):
         self.w_zp_name = w_zp_param_name
         self.w_gidx_name = w_gidx_param_name
 
+    @staticmethod
+    def _validate_config_invariants(
+        c: MPLinearLayerConfig,
+    ) -> tuple[bool, str | None]:
+        if c.zero_points:
+            if c.weight_type.has_bias():
+                return (
+                    False,
+                    "zero_points=True requires an unbiased weight_type, "
+                    f"but got {c.weight_type} with bias",
+                )
+        else:
+            if not c.weight_type.has_bias():
+                return (
+                    False,
+                    "zero_points=False requires a biased weight_type, "
+                    f"but got {c.weight_type} without bias",
+                )
+        return True, None
+
     @abstractmethod
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         raise NotImplementedError
@@ -77,6 +97,23 @@ class MPLinearKernel(ABC):
             replace_parameter(
                 layer, name, torch.nn.Parameter(new_param.data, requires_grad=False)
             )
+
+    def _validate_layer_invariants(self, layer: torch.nn.Module) -> None:
+        if self.config.zero_points:
+            if self.w_zp_name is None or getattr(layer, self.w_zp_name, None) is None:
+                raise AssertionError(
+                    "zero_points=True requires a zero-point parameter to be "
+                    "present on the layer"
+                )
+        else:
+            if (
+                self.w_zp_name is not None
+                and getattr(layer, self.w_zp_name, None) is not None
+            ):
+                raise AssertionError(
+                    "zero_points=False does not allow a zero-point parameter "
+                    "to be provided on the layer"
+                )
 
     def _get_weight_params(
         self, layer: torch.nn.Module

@@ -20,6 +20,9 @@ class XPUwNa16LinearKernel(MPLinearKernel):
 
     @classmethod
     def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
+        ok, err = cls._validate_config_invariants(c)
+        if not ok:
+            return False, err
         if not current_platform.is_xpu():
             return False, "XPUwNa16 only supported on XPU"
 
@@ -57,6 +60,7 @@ class XPUwNa16LinearKernel(MPLinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        self._validate_layer_invariants(layer)
         layer.weight_scale.data = layer.weight_scale.t().contiguous()
 
         if self.config.zero_points:

@@ -115,6 +115,9 @@ class ConchLinearKernel(MPLinearKernel):
 
     @classmethod
     def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
+        ok, err = cls._validate_config_invariants(c)
+        if not ok:
+            return False, err
         if c.weight_type not in _CONCH_SUPPORTED_WEIGHT_TYPES:
             error_msg = (
                 f"Weight type ({c.weight_type}) not supported by "
@@ -146,6 +149,8 @@ class ConchLinearKernel(MPLinearKernel):
     #  `weight_scale` is: {input_dim = 0, output_dim = 1}
     #  `weight_zero_point` is: {input_dim = 1, output_dim = 0, packed_dim = 0}
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self._validate_layer_invariants(layer)
+
         def transform_w_q(x):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
