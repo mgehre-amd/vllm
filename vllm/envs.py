@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_MOE_EXLLAMA: bool = False
+    VLLM_ROCM_USE_MOE_WNA16_CUDA_KERNEL: bool = False
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
@@ -900,6 +901,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Requires exllama-native weight format [E, K/8, N] int32.
     "VLLM_MOE_EXLLAMA": lambda: (
         os.getenv("VLLM_MOE_EXLLAMA", "false").lower() in ("true", "1")
+    ),
+    # Force the native HIP WNA16 MoE kernel on ROCm instead of the default
+    # Triton. The native kernel is slower.
+    "VLLM_ROCM_USE_MOE_WNA16_CUDA_KERNEL": lambda: (
+        os.getenv("VLLM_ROCM_USE_MOE_WNA16_CUDA_KERNEL", "false").lower()
+        in ("true", "1")
     ),
     # Disable aiter ops unless specifically enabled.
     # Acts as a parent switch to enable the rest of the other operations.
