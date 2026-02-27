@@ -950,11 +950,12 @@ set(VLLM_MOE_EXT_SRC
   "csrc/moe/moe_align_sum_kernels.cu"
   "csrc/moe/topk_softmax_kernels.cu"
   "csrc/moe/permute_unpermute_kernels/moe_permute_unpermute_kernel.cu"
-  "csrc/moe/moe_permute_unpermute_op.cu")
+  "csrc/moe/moe_permute_unpermute_op.cu"
+  "csrc/moe/moe_wna16.cu"
+)
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_MOE_EXT_SRC
-    "csrc/moe/moe_wna16.cu"
     "csrc/moe/grouped_topk_kernels.cu")
 endif()
 
