@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import vllm._custom_ops as ops
+from vllm.model_executor.layers.quantization import awq_gemv_config
 from vllm.model_executor.layers.quantization.kernels.mixed_precision.hip_w4a16 import (  # noqa: E501
     HipW4A16LinearKernel,
 )
@@ -128,26 +129,28 @@ def test_hip_w4a16_can_implement_rejects_invalid_configs(overrides, monkeypatch)
 @pytest.mark.parametrize(
     ("input_shape", "expected_shape"),
     [
-        ((8, 128 * 1), (8, 128 * 1)),  # Minimum supported
-        ((2048, 128 * 1), (2048, 128 * 1)),  # Overhead too large, no pad
-        ((2048, 128 * 7), (2048, 128 * 7)),
-        ((2048, 128 * 15), (2048, 128 * 15)),
-        ((2048, 128 * 16), (2048, 128 * 16)),
-        ((2048, 128 * 17), (2048, 128 * 17)),
-        ((2048, 128 * 24), (2048, 128 * 24)),
-        ((2048, 128 * 27), (2048, 128 * 27)),
-        ((8192, 128 * 22), (8192, 128 * 24)),
-        ((8192, 128 * 24), (8192, 128 * 24)),
-        ((12288, 128 * 21), (12288, 128 * 21)),
-        ((12288, 128 * 20), (12288, 128 * 20)),
-        ((16384, 128 * 15), (16384, 128 * 15)),  # N>12288, no pad
-        ((16384, 128 * 22), (16384, 128 * 22)),  # N>12288, no pad (different groups)
+        ((8, 128 * 1), (8, 128 * 1)),  # minimum shape
+        ((2048, 128 * 1), (2048, 128 * 1)),  # too much overhead
+        ((2048, 128 * 15), (2048, 128 * 16)),  # pads to sk=16
+        ((2048, 128 * 17), (2048, 128 * 17)),  # no viable padding
+        ((8192, 128 * 22), (8192, 128 * 24)),  # pads to sk=8
+        ((12288, 128 * 20), (12288, 128 * 20)),  # already divisible
+        ((16384, 128 * 15), (16384, 128 * 16)),  # pads to sk=8
+        ((24576, 128 * 15), (24576, 128 * 16)),  # pads to sk=4
+        ((24576, 128 * 22), (24576, 128 * 24)),  # pads to sk=4
     ],
 )
 @pytest.mark.parametrize("act_dtype", [torch.float16])  # TODO: +torch.bfloat16
 def test_hip_w4a16_process_shapes(input_shape, expected_shape, act_dtype, monkeypatch):
     monkeypatch.setattr(
         ops, "hip_w4a16_linear_kernel_apply_weights", lambda *a, **kw: None
+    )
+    # Force heuristic path by simulating "no config" regardless of device.
+    monkeypatch.delenv("AWQ_GEMV_SPLIT_K", raising=False)
+    monkeypatch.setattr(
+        awq_gemv_config,
+        "get_awq_gemv_config",
+        lambda: None,
     )
     device = "cpu"
 
@@ -231,3 +234,91 @@ def test_hip_w4a16_process_shapes(input_shape, expected_shape, act_dtype, monkey
         expected_k // group_size,
         expected_n // pack_factor,
     )
+
+
+def test_hip_w4a16_env_split_k_override(monkeypatch):
+    monkeypatch.setattr(
+        ops, "hip_w4a16_linear_kernel_apply_weights", lambda *a, **kw: None
+    )
+    # Ensure env override wins even if a config is present.
+    monkeypatch.setattr(
+        awq_gemv_config,
+        "get_awq_gemv_config",
+        lambda: {(896, 2048): 7},
+    )
+    monkeypatch.setenv("AWQ_GEMV_SPLIT_K", "8")
+    device = "cpu"
+
+    _ensure_single_process_model_parallel()
+    group_size = 128
+    pack_factor = 8
+    input_n, input_k = (2048, 896)
+
+    config = MPLinearLayerConfig(
+        full_weight_shape=(input_k, input_n),
+        partition_weight_shape=(input_k, input_n),
+        weight_type=scalar_types.uint4,
+        act_type=torch.float16,
+        group_size=group_size,
+        zero_points=True,
+        has_g_idx=False,
+        out_type=None,
+    )
+    ok, err = HipW4A16LinearKernel.can_implement(config)
+    assert ok, err
+
+    w_q_packed = torch.ones(
+        (input_n, input_k // pack_factor),
+        dtype=torch.int32,
+        device=device,
+    )
+    w_zp_packed = torch.ones(
+        (input_n // pack_factor, input_k // group_size),
+        dtype=torch.int32,
+        device=device,
+    )
+    w_s_data = torch.ones(
+        input_n, input_k // group_size, dtype=torch.float16, device=device
+    )
+
+    layer = torch.nn.Module()
+    weight_loader = lambda *_args, **_kwargs: None
+
+    w_q = PackedvLLMParameter(
+        input_dim=1,
+        output_dim=0,
+        packed_dim=1,
+        packed_factor=pack_factor,
+        weight_loader=weight_loader,
+        data=w_q_packed,
+    )
+    w_s = GroupQuantScaleParameter(
+        output_dim=0,
+        input_dim=1,
+        weight_loader=weight_loader,
+        data=w_s_data,
+    )
+    w_zp = PackedvLLMParameter(
+        input_dim=1,
+        output_dim=0,
+        packed_dim=0,
+        packed_factor=pack_factor,
+        weight_loader=weight_loader,
+        data=w_zp_packed,
+    )
+
+    layer.register_parameter("weight_packed", w_q)
+    layer.register_parameter("weight_scale", w_s)
+    layer.register_parameter("weight_zero_point", w_zp)
+
+    kernel = HipW4A16LinearKernel(
+        config,
+        w_q_param_name="weight_packed",
+        w_s_param_name="weight_scale",
+        w_zp_param_name="weight_zero_point",
+    )
+    kernel.process_weights_after_loading(layer)
+
+    # num_groups = 896 / 128 = 7. split_k=8 forces padding to 8 groups.
+    assert kernel._split_k == 8
+    assert layer.weight_packed.shape == (1024, input_n // pack_factor)

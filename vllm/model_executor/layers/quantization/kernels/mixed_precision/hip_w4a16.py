@@ -86,77 +86,6 @@ class HipW4A16LinearKernel(MPLinearKernel):
 
         return True, None
 
-    @staticmethod
-    def _compute_awq_padding_for_rocm(
-        num_groups: int, N: int, group_size: int = 128
-    ) -> tuple[bool, int, int]:
-        """Compute optimal K-padding for AWQ weights on ROCm.
-
-        The HIP GEMV kernel uses split-k parallelization that requires num_groups
-        to be divisible by specific factors for best performance. For small N,
-        higher split-k values are needed to provide enough parallelism.
-
-        Args:
-            num_groups: Number of quantization groups (K // group_size)
-            N: Output dimension
-            group_size: Quantization group size (must be 128)
-
-        Returns:
-            Tuple of (should_pad, padded_groups, split_k) where:
-            - should_pad: True if padding is beneficial
-            - padded_groups: Target number of groups after padding
-            - split_k: Selected split-k value to use at runtime
-        """
-        if group_size != 128:
-            return False, num_groups, 0
-
-        # Maximum padding overhead allowed (as fraction of original size)
-        MAX_PADDING_OVERHEAD = 0.15  # 15%
-
-        # Determine split-k search bands based on N.
-        # Each band is (hard_min, preferred_min, hard_max).
-        if N <= 4096:
-            band = (2, 7, 20)
-        elif N <= 12288:
-            band = (2, 4, 8)
-        else:
-            # Large N has enough parallelism, no padding needed
-            return False, num_groups, 0
-
-        hard_min, preferred_min, hard_max = band
-
-        # In [preferred_min, hard_max], we pick the split_k with the lowest
-        # acceptable overhead.  If none is acceptable, then in
-        # [hard_min, preferred_min), we pick the greatest split_k with
-        # acceptable overhead.
-        best = None  # (overhead, -split_k, padded)
-        for split_k in range(hard_max, hard_min - 1, -1):
-            padded = ((num_groups + split_k - 1) // split_k) * split_k
-            overhead = (padded - num_groups) / num_groups
-            cand = (
-                (overhead, -split_k, padded)
-                if overhead <= MAX_PADDING_OVERHEAD
-                else None
-            )
-            if split_k >= preferred_min:
-                if cand is not None and (best is None or cand < best):
-                    best = cand
-                if split_k == preferred_min and best is not None:
-                    break
-            elif cand is not None:
-                best = cand
-                break
-
-        if best is not None:
-            _, neg_split_k, padded = best
-            split_k = -neg_split_k
-            if num_groups % split_k == 0:  # perfect fit: don't pad
-                return False, num_groups, split_k
-            else:
-                return True, padded, split_k
-
-        return False, num_groups, 0
-
     # note assumes that
     #  `weight_packed` is: {input_dim = 0, output_dim = 1, packed_dim = 0}
     #  `weight_scale` is: {input_dim = 0, output_dim = 1}
@@ -167,8 +96,14 @@ class HipW4A16LinearKernel(MPLinearKernel):
         K = c.partition_weight_shape[0]
         N = c.partition_weight_shape[1]
         num_groups = 1 if c.group_size == -1 else K // c.group_size
-        should_pad, padded_groups, split_k = self._compute_awq_padding_for_rocm(
-            num_groups=num_groups, N=N, group_size=c.group_size
+        from vllm.model_executor.layers.quantization.awq_gemv_config import (
+            compute_awq_gemv_padding,
+        )
+
+        should_pad, padded_groups, split_k = compute_awq_gemv_padding(
+            num_groups=num_groups,
+            K=K,
+            N=N,
         )
         self._split_k = split_k
         padded_k = padded_groups * c.group_size if should_pad else K
