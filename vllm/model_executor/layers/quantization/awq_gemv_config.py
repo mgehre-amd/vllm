@@ -37,8 +37,52 @@ def _get_config_file_name() -> str:
     return f"device_name={device_name}.json"
 
 
+def _validate_and_normalize_config(
+    config: dict, config_file_path: str
+) -> dict[tuple[int, int], int]:
+    """Validate a loaded AWQ GEMV split-k config and return a normalized copy.
+
+    Checks that every "K,N" key has positive integer components and that
+    every value is a positive integer.  Raises ValueError on malformed
+    entries.  Raises ValueError if the config contains no valid entries.
+
+    Returns a new dict keyed by (K, N) tuples.
+    """
+    normalized: dict[tuple[int, int], int] = {}
+    for key, value in config.items():
+        parts = key.split(",")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid AWQ GEMV split-k config key: {key}")
+        try:
+            ck = int(parts[0])
+            cn = int(parts[1])
+        except ValueError as exc:
+            raise ValueError(f"Invalid AWQ GEMV split-k config key: {key}") from exc
+        if ck <= 0 or cn <= 0:
+            raise ValueError(f"Invalid AWQ GEMV split-k config key: {key}")
+
+        if not isinstance(value, int):
+            raise ValueError(
+                f"Invalid AWQ GEMV split-k config value for {key}: {value}"
+            )
+
+        if value <= 0:
+            raise ValueError(
+                f"Invalid AWQ GEMV split-k config value for {key}: {value}"
+            )
+
+        normalized[(ck, cn)] = value
+
+    if len(normalized) == 0:
+        raise ValueError(
+            f"AWQ GEMV split-k config has no valid entries: {config_file_path}"
+        )
+
+    return normalized
+
+
 @functools.lru_cache
-def get_awq_gemv_config() -> dict[str, int] | None:
+def get_awq_gemv_config() -> dict[tuple[int, int], int] | None:
     """Load the AWQ GEMV split-k config for the current device.
 
     Checks (in order):
@@ -46,7 +90,7 @@ def get_awq_gemv_config() -> dict[str, int] | None:
     2. Built-in awq_gemv_configs/ directory
 
     Returns:
-        Config dict mapping "K,N" strings to split_k values, or None.
+        Config dict mapping (K, N) tuples to split_k values, or None.
     """
     json_file_name = _get_config_file_name()
     config_file_paths: list[str] = []
@@ -72,7 +116,12 @@ def get_awq_gemv_config() -> dict[str, int] | None:
                     config_file_path,
                 )
                 config = json.load(f)
-                return config
+                if not isinstance(config, dict):
+                    raise ValueError(
+                        "AWQ GEMV split-k config must be a JSON object: "
+                        f"{config_file_path}"
+                    )
+                return _validate_and_normalize_config(config, config_file_path)
 
     logger.info(
         "No AWQ GEMV split-k config found for device. "
@@ -95,7 +144,7 @@ def _default_split_k_heuristic(N: int) -> int:
         return 4
 
 
-def _find_nearest_split_k(config: dict[str, int], K: int, N: int) -> int:
+def _find_nearest_split_k(config: dict[tuple[int, int], int], K: int, N: int) -> int:
     """Find the split_k of the closest (K, N) entry in the config.
 
     Uses Euclidean distance in (K, N) space to find the nearest neighbor.
@@ -103,11 +152,7 @@ def _find_nearest_split_k(config: dict[str, int], K: int, N: int) -> int:
     best_dist = math.inf
     best_sk = _default_split_k_heuristic(N)
 
-    for key, sk in config.items():
-        parts = key.split(",")
-        if len(parts) != 2:
-            continue
-        ck, cn = int(parts[0]), int(parts[1])
+    for (ck, cn), sk in config.items():
         dist = math.hypot(ck - K, cn - N)
         if dist < best_dist:
             best_dist = dist
@@ -139,9 +184,8 @@ def get_awq_gemv_split_k(K: int, N: int) -> int:
     # Priority 2: Device config file
     config = get_awq_gemv_config()
     if config is not None:
-        key = f"{K},{N}"
-        if key in config:
-            return config[key]
+        if (K, N) in config:
+            return config[K, N]
         # No exact match - use nearest neighbor from config entries
         sk = _find_nearest_split_k(config, K, N)
         logger.debug(
