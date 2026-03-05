@@ -928,13 +928,13 @@ def main(args: argparse.Namespace):
         start = time.time()
         # Initialize best_configs dict to store results incrementally
         best_configs = {}
-        
+
         # Process each batch size and save incrementally
         for batch_size in batch_sizes:
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"Tuning batch size: {batch_size}")
-            print(f"{'='*60}")
-            
+            print(f"{'=' * 60}")
+
             result = _distribute(
                 "tune",
                 [
@@ -956,7 +956,7 @@ def main(args: argparse.Namespace):
             )
             best_config = sort_config(result[0])
             best_configs[batch_size] = best_config
-            
+
             # Save incrementally after each batch size completes
             save_configs(
                 best_configs,

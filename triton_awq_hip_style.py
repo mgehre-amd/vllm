@@ -12,7 +12,8 @@ HIP kernel strategy:
 - fp32 accumulators for precision
 - Shared memory reduction across splits
 
-Key insight: The HIP kernel is K-major (iterates K in outer loop, outputs per thread in inner),
+Key insight: The HIP kernel is K-major
+(iterates K in outer loop, outputs per thread in inner),
 while most Triton AWQ kernels are N-major (iterate N in outer, K in inner).
 """
 
@@ -296,7 +297,8 @@ def awq_gemv_simple_kernel(
                 # Load activation and convert to fp32
                 x_f32 = tl.load(input_ptr + k).to(tl.float32)
 
-                # Vectorized weight load with non-temporal hint (like HIP's __builtin_nontemporal_load)
+                # Vectorized weight load with non-temporal hint
+                # (like HIP's __builtin_nontemporal_load)
                 qw = tl.load(qweight_base + k * N_PACKED, cache_modifier=".cg")
                 w_f32 = ((qw >> shifts) & 0xF).to(tl.float32)
 
@@ -326,7 +328,9 @@ def awq_gemv_simple(
     num_groups = qzeros.shape[0]
     group_size = K // num_groups
 
-    assert group_size % unroll == 0, f"group_size={group_size} must be divisible by unroll={unroll}"
+    assert group_size % unroll == 0, (
+        f"group_size={group_size} must be divisible by unroll={unroll}"
+    )
 
     output = torch.zeros(N, dtype=torch.float16, device=input.device)
 
@@ -334,9 +338,18 @@ def awq_gemv_simple(
     grid = (num_n_blocks,)
 
     awq_gemv_simple_kernel[grid](
-        input, qweight, qzeros, scales, output,
-        K=K, N=N, GROUP_SIZE=group_size, BLOCK_N=block_n, UNROLL=unroll,
-        num_warps=num_warps, num_stages=num_stages,
+        input,
+        qweight,
+        qzeros,
+        scales,
+        output,
+        K=K,
+        N=N,
+        GROUP_SIZE=group_size,
+        BLOCK_N=block_n,
+        UNROLL=unroll,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
     return output.unsqueeze(0)
@@ -424,7 +437,9 @@ def awq_gemv_hip_style(
     group_size = K // num_groups
 
     # Validate split_k
-    assert num_groups % split_k == 0, f"num_groups={num_groups} must be divisible by split_k={split_k}"
+    assert num_groups % split_k == 0, (
+        f"num_groups={num_groups} must be divisible by split_k={split_k}"
+    )
 
     OUTPUT_PER_THREAD = 8
     assert N % OUTPUT_PER_THREAD == 0, f"N={N} must be divisible by {OUTPUT_PER_THREAD}"
@@ -519,8 +534,8 @@ def awq_gemv_hip_style_v2_kernel(
 
     # Base pointers for this column block
     weight_col_offset = col_packed  # [BLOCK_N // 8] but broadcast as BLOCK_N
-    scale_col_offset = col_offs     # [BLOCK_N]
-    zero_col_offset = col_packed    # [BLOCK_N]
+    scale_col_offset = col_offs  # [BLOCK_N]
+    zero_col_offset = col_packed  # [BLOCK_N]
 
     # Process groups
     for g in tl.range(g_start, g_end, flatten=True):
@@ -529,7 +544,9 @@ def awq_gemv_hip_style_v2_kernel(
         group_zero_base = g * N_PACKED
 
         # Load scales [BLOCK_N] - once per group (fp32 for precision)
-        scales_f32 = tl.load(scales_ptr + group_scale_base + scale_col_offset).to(tl.float32)
+        scales_f32 = tl.load(scales_ptr + group_scale_base + scale_col_offset).to(
+            tl.float32
+        )
 
         # Load and unpack zeros [BLOCK_N] - once per group (fp32 for consistency)
         qz = tl.load(qzeros_ptr + group_zero_base + zero_col_offset)
@@ -551,7 +568,10 @@ def awq_gemv_hip_style_v2_kernel(
 
                 # Load weights with cache hint, convert to fp32
                 weight_row_base = k * N_PACKED
-                qw = tl.load(qweight_ptr + weight_row_base + weight_col_offset, cache_modifier=".cg")
+                qw = tl.load(
+                    qweight_ptr + weight_row_base + weight_col_offset,
+                    cache_modifier=".cg",
+                )
                 w_f32 = ((qw >> shifts) & 0xF).to(tl.float32)
 
                 # Dequantize in fp32 and accumulate
@@ -584,7 +604,9 @@ def awq_gemv_hip_style_v2(
 
     assert num_groups % split_k == 0
     assert N % block_n == 0
-    assert group_size % pipeline_depth == 0, f"group_size must be divisible by PIPELINE_DEPTH={pipeline_depth}"
+    assert group_size % pipeline_depth == 0, (
+        f"group_size must be divisible by PIPELINE_DEPTH={pipeline_depth}"
+    )
 
     partial_output = torch.zeros(split_k, N, dtype=torch.float16, device=input.device)
 
@@ -636,7 +658,9 @@ def benchmark_kernels():
     torch.manual_seed(42)
     input_tensor = torch.randn(K, dtype=torch.float16, device="cuda")
     qweight = torch.randint(0, 2**31, (K, N // 8), dtype=torch.int32, device="cuda")
-    qzeros = torch.randint(0, 2**31, (num_groups, N // 8), dtype=torch.int32, device="cuda")
+    qzeros = torch.randint(
+        0, 2**31, (num_groups, N // 8), dtype=torch.int32, device="cuda"
+    )
     scales = torch.randn(num_groups, N, dtype=torch.float16, device="cuda") * 0.01
 
     # Reference: dequantize + matmul
@@ -678,8 +702,14 @@ def benchmark_kernels():
                 continue
 
             output = awq_gemv_simple(
-                input_tensor, qweight, qzeros, scales,
-                block_n=block_n, num_warps=num_warps, unroll=unroll, num_stages=num_stages
+                input_tensor,
+                qweight,
+                qzeros,
+                scales,
+                block_n=block_n,
+                num_warps=num_warps,
+                unroll=unroll,
+                num_stages=num_stages,
             )
 
             diff = (output.squeeze() - output_ref).abs()
@@ -692,16 +722,23 @@ def benchmark_kernels():
 
             def run():
                 return awq_gemv_simple(
-                    input_tensor, qweight, qzeros, scales,
-                    block_n=block_n, num_warps=num_warps, unroll=unroll, num_stages=num_stages
+                    input_tensor,
+                    qweight,
+                    qzeros,
+                    scales,
+                    block_n=block_n,
+                    num_warps=num_warps,
+                    unroll=unroll,
+                    num_stages=num_stages,
                 )
 
             from vllm.triton_utils import triton
+
             ms = triton.testing.do_bench(run, warmup=25, rep=100, return_mode="min")
             bw = bytes_moved / (ms * 1e6)
 
             results.append((name, ms, bw, max_diff))
-            print(f"{name}: {ms*1000:.1f} us, {bw:.1f} GB/s")
+            print(f"{name}: {ms * 1000:.1f} us, {bw:.1f} GB/s")
 
         except Exception as e:
             print(f"{name}: ERROR - {e}")
@@ -721,8 +758,13 @@ def benchmark_kernels():
                 continue
 
             output = awq_gemv_hip_style_v2(
-                input_tensor, qweight, qzeros, scales,
-                split_k=split_k, block_n=block_n, num_warps=num_warps
+                input_tensor,
+                qweight,
+                qzeros,
+                scales,
+                split_k=split_k,
+                block_n=block_n,
+                num_warps=num_warps,
             )
 
             diff = (output.squeeze() - output_ref).abs()
@@ -735,16 +777,22 @@ def benchmark_kernels():
 
             def run():
                 return awq_gemv_hip_style_v2(
-                    input_tensor, qweight, qzeros, scales,
-                    split_k=split_k, block_n=block_n, num_warps=num_warps
+                    input_tensor,
+                    qweight,
+                    qzeros,
+                    scales,
+                    split_k=split_k,
+                    block_n=block_n,
+                    num_warps=num_warps,
                 )
 
             from vllm.triton_utils import triton
+
             ms = triton.testing.do_bench(run, warmup=25, rep=100, return_mode="min")
             bw = bytes_moved / (ms * 1e6)
 
             results.append((name, ms, bw, max_diff))
-            print(f"{name}: {ms*1000:.1f} us, {bw:.1f} GB/s")
+            print(f"{name}: {ms * 1000:.1f} us, {bw:.1f} GB/s")
 
         except Exception as e:
             print(f"{name}: ERROR - {e}")
@@ -761,10 +809,13 @@ def benchmark_kernels():
             return awq_gemv_hip(input_tensor, qweight, scales, qzeros)
 
         from vllm.triton_utils import triton
+
         ms = triton.testing.do_bench(run_hip, warmup=25, rep=100, return_mode="min")
         bw = bytes_moved / (ms * 1e6)
 
-        print(f"\nHIP kernel: {ms*1000:.1f} us, {bw:.1f} GB/s (max_diff={max_diff:.4f})")
+        print(
+            f"\nHIP kernel: {ms * 1000:.1f} us, {bw:.1f} GB/s (max_diff={max_diff:.4f})"
+        )
         results.append(("HIP kernel", ms, bw, max_diff))
     except Exception as e:
         print(f"\nHIP kernel: not available ({e})")
@@ -776,12 +827,15 @@ def benchmark_kernels():
     print(f"{'Kernel':<40} | {'Time':>10} | {'BW':>10} | {'Diff':>10}")
     print("-" * 80)
     for name, ms, bw, max_diff in sorted(results, key=lambda x: -x[2]):
-        print(f"{name:<40} | {ms*1000:>8.1f} us | {bw:>8.1f} GB/s | {max_diff:>10.4f}")
+        print(
+            f"{name:<40} | {ms * 1000:>8.1f} us | {bw:>8.1f} GB/s | {max_diff:>10.4f}"
+        )
 
 
 def dump_triton_asm():
     """Dump Triton kernel assembly for analysis."""
     import os
+
     os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
     N, K = 22016, 4096
@@ -794,10 +848,14 @@ def dump_triton_asm():
     torch.manual_seed(42)
     input_tensor = torch.randn(K, dtype=torch.float16, device="cuda")
     qweight = torch.randint(0, 2**31, (K, N // 8), dtype=torch.int32, device="cuda")
-    qzeros = torch.randint(0, 2**31, (num_groups, N // 8), dtype=torch.int32, device="cuda")
+    qzeros = torch.randint(
+        0, 2**31, (num_groups, N // 8), dtype=torch.int32, device="cuda"
+    )
     scales = torch.randn(num_groups, N, dtype=torch.float16, device="cuda") * 0.01
 
-    partial_output = torch.zeros(split_k, N, dtype=torch.float16, device=input_tensor.device)
+    partial_output = torch.zeros(
+        split_k, N, dtype=torch.float16, device=input_tensor.device
+    )
     num_n_blocks = N // block_n
     grid = (num_n_blocks, split_k)
 
@@ -826,12 +884,12 @@ def dump_triton_asm():
     try:
         compiled = awq_gemv_hip_style_v2_kernel.cache
         for key, val in compiled.items():
-            if hasattr(val, 'asm'):
+            if hasattr(val, "asm"):
                 print(f"Key: {key}")
                 asm = val.asm
                 if isinstance(asm, dict):
                     for asm_key, asm_val in asm.items():
-                        if 'amdgcn' in asm_key or 'hsaco' in asm_key:
+                        if "amdgcn" in asm_key or "hsaco" in asm_key:
                             print(f"\n{asm_key}:")
                             print(asm_val[:5000] if len(asm_val) > 5000 else asm_val)
                 else:
@@ -848,6 +906,7 @@ def dump_triton_asm():
 
 if __name__ == "__main__":
     import sys
+
     if len(sys.argv) > 1 and sys.argv[1] == "--asm":
         dump_triton_asm()
     else:

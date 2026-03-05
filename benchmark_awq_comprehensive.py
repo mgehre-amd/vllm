@@ -120,7 +120,8 @@ def convert_vllm_to_autoawq_tensors(qweight, qzeros, scales, group_size):
     num_groups = K // group_size
 
     # Step 1: Unpack vLLM weights with AWQ order
-    # AWQ order: [0, 4, 1, 5, 2, 6, 3, 7] - meaning bit position i*4 contains element at AWQ_order[i]
+    # AWQ order: [0, 4, 1, 5, 2, 6, 3, 7]
+    # bit position i*4 contains element at AWQ_order[i]
     awq_order = [0, 4, 1, 5, 2, 6, 3, 7]
     reverse_awq_order = [
         awq_order.index(i) for i in range(8)
@@ -174,7 +175,9 @@ def test_autoawq_correctness(autoawq_module, shapes, awq_dequantize_triton):
     print("AUTOAWQ CORRECTNESS TEST")
     print("=" * 90)
     print(
-        f"{'N':>6} x {'K':<6} | {'G':>4} | {'Max Diff':>12} | {'Mean Diff':>12} | {'Status':>8}"
+        f"{'N':>6} x {'K':<6} | {'G':>4}"
+        f" | {'Max Diff':>12} | {'Mean Diff':>12}"
+        f" | {'Status':>8}"
     )
     print("-" * 90)
 
@@ -187,14 +190,18 @@ def test_autoawq_correctness(autoawq_module, shapes, awq_dequantize_triton):
         # AutoAWQ only supports group_size 64 and 128
         if group_size not in [64, 128]:
             print(
-                f"{N:>6} x {K:<6} | {group_size:>4} | {'N/A':>12} | {'N/A':>12} | {'SKIP':>8} (g!=64,128)"
+                f"{N:>6} x {K:<6} | {group_size:>4}"
+                f" | {'N/A':>12} | {'N/A':>12}"
+                f" | {'SKIP':>8} (g!=64,128)"
             )
             continue
 
         # N must be divisible by 4 for the kernel grid
         if N % 4 != 0:
             print(
-                f"{N:>6} x {K:<6} | {group_size:>4} | {'N/A':>12} | {'N/A':>12} | {'SKIP':>8} (N%4!=0)"
+                f"{N:>6} x {K:<6} | {group_size:>4}"
+                f" | {'N/A':>12} | {'N/A':>12}"
+                f" | {'SKIP':>8} (N%4!=0)"
             )
             continue
 
@@ -203,7 +210,9 @@ def test_autoawq_correctness(autoawq_module, shapes, awq_dequantize_triton):
         min_k = 1024 if group_size == 128 else 512
         if min_k > K:
             print(
-                f"{N:>6} x {K:<6} | {group_size:>4} | {'N/A':>12} | {'N/A':>12} | {'SKIP':>8} (K<{min_k})"
+                f"{N:>6} x {K:<6} | {group_size:>4}"
+                f" | {'N/A':>12} | {'N/A':>12}"
+                f" | {'SKIP':>8} (K<{min_k})"
             )
             continue
 
@@ -251,7 +260,8 @@ def test_autoawq_correctness(autoawq_module, shapes, awq_dequantize_triton):
                 or torch.isnan(output_ref).any().item()
             )
 
-            # Use tolerance for fp16 precision (0.5 is reasonable for accumulated fp16 errors)
+            # Use tolerance for fp16 precision
+            # (0.5 is reasonable for accumulated fp16 errors)
             passed = not has_nan and max_diff < 0.5
             all_pass = all_pass and passed
 
@@ -263,11 +273,15 @@ def test_autoawq_correctness(autoawq_module, shapes, awq_dequantize_triton):
                 status = "FAIL"
 
             print(
-                f"{N:>6} x {K:<6} | {group_size:>4} | {max_diff:>12.6f} | {mean_diff:>12.6f} | {status:>8}"
+                f"{N:>6} x {K:<6} | {group_size:>4}"
+                f" | {max_diff:>12.6f} | {mean_diff:>12.6f}"
+                f" | {status:>8}"
             )
         except Exception:
             print(
-                f"{N:>6} x {K:<6} | {group_size:>4} | {'CRASH':>12} | {'CRASH':>12} | {'CRASH':>8}"
+                f"{N:>6} x {K:<6} | {group_size:>4}"
+                f" | {'CRASH':>12} | {'CRASH':>12}"
+                f" | {'CRASH':>8}"
             )
             all_pass = False
             # Reset GPU state
@@ -552,7 +566,8 @@ def main():
     def calculate_bytes(K, N, group_size, M=1):
         """Calculate bytes moved for bandwidth calculation."""
         num_groups = K // group_size
-        # input[M,K] + qweight[K,N//8] + qzeros[K//G,N//8] + scales[K//G,N] + output[M,N]
+        # input[M,K] + qweight[K,N//8] + qzeros[K//G,N//8]
+        # + scales[K//G,N] + output[M,N]
         return (
             M * K * 2
             + K * (N // 8) * 4
@@ -573,7 +588,10 @@ def main():
         print(f"CORRECTNESS TEST (multiple input patterns, M={M})")
         print("=" * 100)
         print(
-            f"{'N':>6} x {'K':<6} | {'G':>4} | {'Pattern':<12} | {'Config':<20} | {'Max Diff':>10} | {'Rel Err':>10} | {'Status':>8}"
+            f"{'N':>6} x {'K':<6} | {'G':>4}"
+            f" | {'Pattern':<12} | {'Config':<20}"
+            f" | {'Max Diff':>10} | {'Rel Err':>10}"
+            f" | {'Status':>8}"
         )
         print("-" * 100)
 
@@ -702,7 +720,12 @@ def main():
                 status = "PASS" if passed else "FAIL"
 
                 print(
-                    f"{N:>6} x {K:<6} | {group_size:>4} | {pattern_name:<12} | {config:<20} | {max_diff:>10.4f} | {rel_err:>10.2%} | {status:>8}"
+                    f"{N:>6} x {K:<6} | {group_size:>4}"
+                    f" | {pattern_name:<12}"
+                    f" | {config:<20}"
+                    f" | {max_diff:>10.4f}"
+                    f" | {rel_err:>10.2%}"
+                    f" | {status:>8}"
                 )
 
         print("-" * 100)
@@ -713,7 +736,9 @@ def main():
         """Run correctness tests specifically for the HIP GEMV kernel."""
         if M > 1:
             print(
-                "\nSkipping HIP kernel correctness test (M>1, HIP GEMV only supports M=1)"
+                "\nSkipping HIP kernel correctness"
+                " test (M>1, HIP GEMV only supports"
+                " M=1)"
             )
             return True
 
@@ -733,7 +758,10 @@ def main():
         print("HIP GEMV KERNEL CORRECTNESS TEST")
         print("=" * 90)
         print(
-            f"{'N':>6} x {'K':<6} | {'G':>4} | {'Groups':>6} | {'Kernel':<12} | {'Max Diff':>10} | {'Rel Err':>10} | {'Status':>8}"
+            f"{'N':>6} x {'K':<6} | {'G':>4}"
+            f" | {'Groups':>6} | {'Kernel':<12}"
+            f" | {'Max Diff':>10}"
+            f" | {'Rel Err':>10} | {'Status':>8}"
         )
         print("-" * 90)
 
@@ -783,7 +811,11 @@ def main():
                 output_hip = awq_gemv_hip(activation, qweight, scales, qzeros)
             except Exception as e:
                 print(
-                    f"{N:>6} x {K:<6} | {group_size:>4} | {num_groups:>6} | {kernel_type:<12} | ERROR: {e}"
+                    f"{N:>6} x {K:<6}"
+                    f" | {group_size:>4}"
+                    f" | {num_groups:>6}"
+                    f" | {kernel_type:<12}"
+                    f" | ERROR: {e}"
                 )
                 all_pass = False
                 continue
@@ -799,7 +831,12 @@ def main():
             status = "PASS" if passed else "FAIL"
 
             print(
-                f"{N:>6} x {K:<6} | {group_size:>4} | {num_groups:>6} | {kernel_type:<12} | {max_diff:>10.4f} | {rel_err:>10.4%} | {status:>8}"
+                f"{N:>6} x {K:<6} | {group_size:>4}"
+                f" | {num_groups:>6}"
+                f" | {kernel_type:<12}"
+                f" | {max_diff:>10.4f}"
+                f" | {rel_err:>10.4%}"
+                f" | {status:>8}"
             )
 
         print("-" * 90)
@@ -807,7 +844,8 @@ def main():
         return all_pass
 
     def apply_hip_preprocessing(qweight, qzeros, scales, group_size, N):
-        """Apply the same preprocessing as AWQLinearMethod.process_weights_after_loading.
+        """Apply the same preprocessing as
+        AWQLinearMethod.process_weights_after_loading.
 
         Uses the shared compute_awq_padding_for_rocm function from awq.py to ensure
         padding logic stays in sync.
@@ -869,14 +907,25 @@ def main():
 
         if include_autoawq:
             print(
-                f"{'N':>6} x {'K':<6} | {'G':>4} | {'vLLM Triton':<20} | {'AutoAWQ CUDA':<20} | {'Speedup':>8}"
+                f"{'N':>6} x {'K':<6} | {'G':>4}"
+                f" | {'vLLM Triton':<20}"
+                f" | {'AutoAWQ CUDA':<20}"
+                f" | {'Speedup':>8}"
             )
             print(
-                f"{'':>6}   {'':>6} | {'':>4} | {'GiB/s':>8} {'Time':>10} | {'GiB/s':>8} {'Time':>10} | {'':>8}"
+                f"{'':>6}   {'':>6} | {'':>4}"
+                f" | {'GiB/s':>8} {'Time':>10}"
+                f" | {'GiB/s':>8} {'Time':>10}"
+                f" | {'':>8}"
             )
         else:
             print(
-                f"{'N':>6} x {'K':<6} | {'G':>4} | {'Padded':>14} | {'Config':<22} | {'GiB/s':>10} | {'Time':>10} | {'% Peak':>10} | {'vs Ref':>10}"
+                f"{'N':>6} x {'K':<6} | {'G':>4}"
+                f" | {'Padded':>14}"
+                f" | {'Config':<22}"
+                f" | {'GiB/s':>10} | {'Time':>10}"
+                f" | {'% Peak':>10}"
+                f" | {'vs Ref':>10}"
             )
         print("-" * 130)
 
@@ -953,7 +1002,13 @@ def main():
                 speedup = ms_autoawq / ms_triton  # >1 means Triton is faster
 
                 print(
-                    f"{N:>6} x {K:<6} | {group_size:>4} | {bw_triton:>8.1f} {ms_triton * 1000:>8.0f} us | {bw_autoawq:>8.1f} {ms_autoawq * 1000:>8.0f} us | {speedup:>7.2f}x"
+                    f"{N:>6} x {K:<6}"
+                    f" | {group_size:>4}"
+                    f" | {bw_triton:>8.1f}"
+                    f" {ms_triton * 1000:>8.0f} us"
+                    f" | {bw_autoawq:>8.1f}"
+                    f" {ms_autoawq * 1000:>8.0f} us"
+                    f" | {speedup:>7.2f}x"
                 )
                 results.append(
                     (K, N, group_size, bw_triton, ms_triton, bw_autoawq, ms_autoawq)
@@ -967,7 +1022,12 @@ def main():
                 else:
                     reason = "N%4!=0"
                 print(
-                    f"{N:>6} x {K:<6} | {group_size:>4} | {bw_triton:>8.1f} {ms_triton * 1000:>8.0f} us | {'N/A (' + reason + ')':>20} | {'N/A':>8}"
+                    f"{N:>6} x {K:<6}"
+                    f" | {group_size:>4}"
+                    f" | {bw_triton:>8.1f}"
+                    f" {ms_triton * 1000:>8.0f} us"
+                    f" | " + f"{'N/A (' + reason + ')':>20}"
+                    f" | {'N/A':>8}"
                 )
                 results.append((K, N, group_size, bw_triton, ms_triton, None, None))
             else:
@@ -995,7 +1055,14 @@ def main():
                     vs_ref = "no ref"
 
                 print(
-                    f"{N:>6} x {K:<6} | {group_size:>4} | {padded_str:>14} | {config:<22} | {bw_triton:>10.1f} | {ms_triton * 1000:>8.0f} us | {pct_peak:>9.1f}% | {vs_ref:>10}"
+                    f"{N:>6} x {K:<6}"
+                    f" | {group_size:>4}"
+                    f" | {padded_str:>14}"
+                    f" | {config:<22}"
+                    f" | {bw_triton:>10.1f}"
+                    f" | {ms_triton * 1000:>8.0f} us"
+                    f" | {pct_peak:>9.1f}%"
+                    f" | {vs_ref:>10}"
                 )
                 results.append((K, N, group_size, bw_triton, ms_triton, config))
 
@@ -1007,11 +1074,17 @@ def main():
             print("-" * 70)
             for N, K, G, actual, expected, ratio in regressions:
                 print(
-                    f"  {N}x{K} G={G}: {actual:.1f} GiB/s vs {expected:.1f} GiB/s expected ({ratio * 100:.0f}%)"
+                    f"  {N}x{K} G={G}:"
+                    f" {actual:.1f} GiB/s"
+                    f" vs {expected:.1f} GiB/s"
+                    f" expected ({ratio * 100:.0f}%)"
                 )
             print("-" * 70)
             print(
-                f"  Tolerance: {PERF_TOLERANCE * 100:.0f}% (values below {100 - PERF_TOLERANCE * 100:.0f}% of reference trigger warning)"
+                f"  Tolerance: {PERF_TOLERANCE * 100:.0f}%"
+                f" (values below"
+                f" {100 - PERF_TOLERANCE * 100:.0f}%"
+                f" of reference trigger warning)"
             )
 
         return results
@@ -1098,18 +1171,25 @@ def main():
                                 bw = bytes_moved / (ms * GIB_DIVISOR)
                                 if bw > best_bw:
                                     best_bw = bw
-                                    best_config = f"block_n={block_n}, warps={num_warps}, split_k={split_k}"
+                                    best_config = (
+                                        f"block_n={block_n},"
+                                        f" warps={num_warps},"
+                                        f" split_k={split_k}"
+                                    )
                         except Exception:
                             pass
 
             print(
-                f"  BEST: {best_bw:.1f} GiB/s ({best_bw / PEAK_BW * 100:.1f}%), {best_config}"
+                f"  BEST: {best_bw:.1f} GiB/s"
+                f" ({best_bw / PEAK_BW * 100:.1f}%),"
+                f" {best_config}"
             )
 
     def calculate_gemm_bytes(M, K, N, group_size):
         """Calculate bytes moved for GEMM bandwidth calculation."""
         num_groups = K // group_size
-        # input[M,K] + qweight[K,N//8] + qzeros[K//G,N//8] + scales[K//G,N] + output[M,N]
+        # input[M,K] + qweight[K,N//8] + qzeros[K//G,N//8]
+        # + scales[K//G,N] + output[M,N]
         return (
             M * K * 2  # input fp16
             + K * (N // 8) * 4  # qweight int32
@@ -1164,7 +1244,10 @@ Strix Halo differences:
             print(f"M = {M}")
             print(f"{'=' * 130}")
             print(
-                f"{'N':>6} x {'K':<6} | {'Config':<50} | {'Time':>10} | {'TFLOPS':>8} | {'GiB/s':>10} | {'% Peak':>8}"
+                f"{'N':>6} x {'K':<6}"
+                f" | {'Config':<50}"
+                f" | {'Time':>10} | {'TFLOPS':>8}"
+                f" | {'GiB/s':>10} | {'% Peak':>8}"
             )
             print("-" * 130)
 
@@ -1261,9 +1344,7 @@ Strix Halo differences:
                                             # Quick correctness check
                                             out = run()
                                             diff = (out - output_ref).abs().max().item()
-                                            if (
-                                                diff > 0.5
-                                            ):  # Allow slightly larger tolerance for GEMM
+                                            if diff > 0.5:  # Larger GEMM tolerance
                                                 continue
 
                                             # Benchmark
@@ -1274,7 +1355,14 @@ Strix Halo differences:
                                             )
                                             if ms < best_time:
                                                 best_time = ms
-                                                best_config = f"m={block_m},n={block_n},k={block_k},sk={split_k},st={num_stages},w={num_warps}"
+                                                best_config = (
+                                                    f"m={block_m},"
+                                                    f"n={block_n},"
+                                                    f"k={block_k},"
+                                                    f"sk={split_k},"
+                                                    f"st={num_stages},"
+                                                    f"w={num_warps}"
+                                                )
                                                 best_correct = True
                                         except Exception:
                                             # Skip invalid configs
@@ -1285,7 +1373,12 @@ Strix Halo differences:
                     tflops = flops / (best_time * 1e9)
                     pct_peak = bw / PEAK_BW * 100
                     print(
-                        f"{N:>6} x {K:<6} | {best_config:<50} | {best_time * 1000:>8.0f} us | {tflops:>7.2f} | {bw:>10.1f} | {pct_peak:>7.1f}%"
+                        f"{N:>6} x {K:<6}"
+                        f" | {best_config:<50}"
+                        f" | {best_time * 1000:>8.0f} us"
+                        f" | {tflops:>7.2f}"
+                        f" | {bw:>10.1f}"
+                        f" | {pct_peak:>7.1f}%"
                     )
                 else:
                     print(f"{N:>6} x {K:<6} | NO VALID CONFIG FOUND")
@@ -1321,7 +1414,9 @@ Based on benchmarking, consider these changes for Strix Halo:
         )
         if not autoawq_correct:
             print(
-                "\nWARNING: AutoAWQ correctness test failed! Benchmark results may not be valid."
+                "\nWARNING: AutoAWQ correctness test"
+                " failed! Benchmark results may not"
+                " be valid."
             )
 
     # Run tests
