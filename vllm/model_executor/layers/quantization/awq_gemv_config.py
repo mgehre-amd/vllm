@@ -199,3 +199,44 @@ def get_awq_gemv_split_k(K: int, N: int) -> int:
 
     # Priority 3: Default heuristic (no config file at all)
     return _default_split_k_heuristic(N)
+
+
+def compute_awq_gemv_padding(
+    num_groups: int,
+    K: int,
+    N: int,
+) -> tuple[bool, int, int]:
+    """Compute padding and split-k selection for AWQ GEMV.
+
+    Priority order:
+    1. AWQ_GEMV_SPLIT_K environment variable (manual override)
+    2. Device config file (exact/nearest neighbor split-k)
+    3. Default heuristic (based on N)
+
+    Returns:
+        Tuple of (should_pad, padded_groups, split_k).
+    """
+    target_split_k = get_awq_gemv_split_k(K, N)
+
+    if num_groups % target_split_k == 0:
+        return False, num_groups, target_split_k
+
+    MAX_PADDING_OVERHEAD = 0.15
+
+    candidates = [target_split_k] + [sk for sk in [16, 8, 4, 2] if sk < target_split_k]
+
+    for split_k in candidates:
+        if num_groups % split_k == 0:
+            return False, num_groups, split_k
+
+        padded = ((num_groups + split_k - 1) // split_k) * split_k
+        overhead = (padded - num_groups) / num_groups
+        if overhead > MAX_PADDING_OVERHEAD:
+            continue
+
+        padded_K = padded * (K // num_groups)
+        runtime_sk = get_awq_gemv_split_k(padded_K, N)
+        if padded % runtime_sk == 0:
+            return True, padded, runtime_sk
+
+    return False, num_groups, target_split_k
