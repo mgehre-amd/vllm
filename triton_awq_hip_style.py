@@ -46,10 +46,6 @@ def awq_gemv_hip_style_kernel(
     pid_n = tl.program_id(0)  # Which block of N
     pid_k = tl.program_id(1)  # Which K split
 
-    # Calculate output column range for this thread
-    # Each block handles THREADS_PER_SPLIT * OUTPUT_PER_THREAD outputs
-    OUTPUTS_PER_BLOCK: tl.constexpr = THREADS_PER_SPLIT * OUTPUT_PER_THREAD
-
     # Thread ID within the block (0 to THREADS_PER_SPLIT-1)
     # In Triton, we simulate this by having each "program" be like one HIP thread
     # But Triton launches program_id(0) * program_id(1) programs
@@ -81,7 +77,6 @@ def awq_gemv_hip_style_kernel(
     groups_per_split = num_groups // SPLIT_K
     g_start = pid_k * groups_per_split
     g_end = g_start + groups_per_split
-    k_start = g_start * GROUP_SIZE
 
     N_packed = N // 8
 
@@ -522,10 +517,6 @@ def awq_gemv_hip_style_v2_kernel(
     g_start = pid_k * groups_per_split
     g_end = g_start + groups_per_split
 
-    # Pre-compute base pointer offsets (element offsets, not byte offsets)
-    # These will be scaled by element size in tl.load
-    k_start = g_start * GROUP_SIZE
-
     # Weight row stride = N_PACKED elements per row
     # W_STRIDE: tl.constexpr = N_PACKED
 
@@ -720,7 +711,12 @@ def benchmark_kernels():
                 print(f"{name}: INCORRECT (max_diff={max_diff:.4f})")
                 continue
 
-            def run():
+            def run(
+                block_n=block_n,
+                num_warps=num_warps,
+                unroll=unroll,
+                num_stages=num_stages,
+            ):
                 return awq_gemv_simple(
                     input_tensor,
                     qweight,
@@ -775,7 +771,7 @@ def benchmark_kernels():
                 print(f"{name}: INCORRECT (max_diff={max_diff:.4f})")
                 continue
 
-            def run():
+            def run(split_k=split_k, block_n=block_n, num_warps=num_warps):
                 return awq_gemv_hip_style_v2(
                     input_tensor,
                     qweight,
@@ -860,7 +856,7 @@ def dump_triton_asm():
     grid = (num_n_blocks, split_k)
 
     # Force compilation and get kernel
-    kernel = awq_gemv_hip_style_v2_kernel[grid](
+    awq_gemv_hip_style_v2_kernel[grid](
         input_tensor,
         qweight,
         qzeros,

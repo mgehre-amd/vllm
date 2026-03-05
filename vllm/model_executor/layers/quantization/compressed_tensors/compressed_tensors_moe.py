@@ -1956,6 +1956,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
             # Build modular kernel for exllama path
             self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            assert self.moe_quant_config is not None
             layer.w13_weight = layer.w13_weight_packed
             layer.w2_weight = layer.w2_weight_packed
             self.moe_mk = FusedMoEModularKernel(

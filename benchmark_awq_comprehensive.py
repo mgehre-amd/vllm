@@ -977,7 +977,12 @@ def main():
                 input_for_bench = input_tensor
 
             # vLLM Triton benchmark
-            def run_triton():
+            def run_triton(
+                input_for_bench=input_for_bench,
+                qweight=qweight,
+                scales=scales,
+                qzeros=qzeros,
+            ):
                 return _awq_gemm_triton(
                     input_for_bench, qweight, scales, qzeros, split_k_iters=8
                 )
@@ -992,7 +997,13 @@ def main():
                     qweight_orig, qzeros_orig, scales_orig, group_size
                 )
 
-                def run_autoawq():
+                def run_autoawq(
+                    input_tensor=input_tensor,
+                    kernel_awq=kernel_awq,
+                    scales_awq=scales_awq,
+                    zeros_awq=zeros_awq,
+                    group_size=group_size,
+                ):
                     return autoawq_module.gemv_forward(
                         input_tensor, kernel_awq, scales_awq, zeros_awq, group_size
                     )
@@ -1138,7 +1149,20 @@ def main():
                         )
                         result = torch.zeros(1, N, dtype=torch.float16, device="cuda")
 
-                        def run():
+                        def run(
+                            N=N,
+                            block_n=block_n,
+                            split_k=split_k,
+                            input_tensor=input_tensor,
+                            qweight=qweight,
+                            qzeros=qzeros,
+                            scales=scales,
+                            partial=partial,
+                            K=K,
+                            group_size=group_size,
+                            num_warps=num_warps,
+                            result=result,
+                        ):
                             awq_gemv_kernel_split_k[(triton.cdiv(N, block_n), split_k)](
                                 input_tensor,
                                 qweight,
@@ -1318,7 +1342,26 @@ Strix Halo differences:
                                                 split_k,
                                             )
 
-                                            def run():
+                                            def run(
+                                                result=result,
+                                                grid=grid,
+                                                input_tensor=input_tensor,
+                                                qweight=qweight,
+                                                qzeros=qzeros,
+                                                scales=scales,
+                                                M=M,
+                                                N=N,
+                                                K=K,
+                                                group_size=group_size,
+                                                block_m=block_m,
+                                                block_n=block_n,
+                                                block_k=block_k,
+                                                split_k=split_k,
+                                                num_k_tiles=num_k_tiles,
+                                                k_group=k_group,
+                                                num_stages=num_stages,
+                                                num_warps=num_warps,
+                                            ):
                                                 result.zero_()
                                                 awq_gemm_kernel[grid](
                                                     input_tensor,
