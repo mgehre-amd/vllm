@@ -184,24 +184,23 @@ class ExllamaExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
         tw = topk_weights if topk_weights is not None else hidden_states.new_empty(0)
 
-        num_rows = sorted_token_ids.size(0)
+        num_slots = sorted_token_ids.size(0)
         P = num_tokens * top_k_num
 
         if block_size_m > 1:
-            # Pre-permute: gather hidden_states rows into block-aligned layout.
-            # sorted_token_ids[i] encodes (token * topk + slot); dividing by
-            # topk recovers the original token index.
-            gather_ids = (sorted_token_ids.clamp(max=P - 1) // top_k_num).long()
-            gemm1_in = _resize_cache(workspace13, (num_rows, K))
-            gemm1_in.copy_(hidden_states[gather_ids])
+            source_rows = (sorted_token_ids // top_k_num).clamp(max=num_tokens - 1)
+            # Permute activations into workspace13 so each expert's
+            # tokens are contiguous.  workspace13 is reused for act_out
+            # after GEMM1 has consumed gemm1_in.
+            gemm1_in = _resize_cache(workspace13, (num_slots, K))
+            torch.index_select(hidden_states, 0, source_rows.long(), out=gemm1_in)
         else:
             gemm1_in = hidden_states
 
-        # ---- GEMM 1 ----
-        # Scattered kernel (block_size_m=1) divides token_id by top_k to
-        # recover the hidden_states row.  Contiguous kernel reads sequentially
-        # from the pre-permuted buffer so top_k=1.
-        gemm1_out = _resize_cache(workspace2, (num_rows, N))
+        gemm1_out = _resize_cache(workspace2, (num_slots, N))
+        act_out = _resize_cache(workspace13, (num_slots, activation_out_dim))
+        gemm2_out = _resize_cache(workspace2, (num_slots, K))
+        # GEMM 1
         fused_moe_exllama_gemm(
             gemm1_in,
             w1,
@@ -216,15 +215,13 @@ class ExllamaExperts(mk.FusedMoEPermuteExpertsUnpermute):
             block_size_m=block_size_m,
         )
 
-        # ---- Activation ----
-        act_out = _resize_cache(workspace13, (num_rows, activation_out_dim))
+        # Activation (elementwise, order-independent)
         apply_moe_activation(activation, act_out, gemm1_out)
 
         # ---- GEMM 2 ----
         # top_k=1: each act_out row is one slot's activation, read it
         # directly.  Router weights are always applied by moe_unpermute
         # in the reduce step, never by the GEMM kernel.
-        gemm2_out = _resize_cache(workspace2, (num_rows, K))
         fused_moe_exllama_gemm(
             act_out,
             w2,
@@ -249,7 +246,7 @@ class ExllamaExperts(mk.FusedMoEPermuteExpertsUnpermute):
                 P + 1, dtype=torch.int32, device=hidden_states.device
             )
             aligned_arange = torch.arange(
-                num_rows, dtype=torch.int32, device=hidden_states.device
+                num_slots, dtype=torch.int32, device=hidden_states.device
             )
             inv_perm_buf.scatter_(
                 0, sorted_token_ids.clamp(max=P).long(), aligned_arange
