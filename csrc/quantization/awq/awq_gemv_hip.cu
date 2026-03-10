@@ -34,6 +34,11 @@ enum class PackingOrder {
   AWQ,
 };
 
+enum class MixtureOfExperts {
+  NO,
+  YES,
+};
+
 // Number of K-elements processed per inner-loop iteration in the GEMV kernel.
 // G (group size) must be a positive multiple of this value.
 static constexpr int PIPELINE_DEPTH = 16;
@@ -64,14 +69,19 @@ static constexpr uint32_t FP16_1024_PAIR = 0x64006400u;
 // AWQ GEMV Kernel with Split-K parallelism
 // Accumulates in fp32 for precision, supports SPLIT_K = 1, 2, 4, 8, 16
 // ============================================================================
-template <int OUTPUT_PER_THREAD, int SPLIT_K, PackingOrder PACKING>
+template <int OUTPUT_PER_THREAD, int SPLIT_K, PackingOrder PACKING,
+          MixtureOfExperts MOE>
 __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
     const __half* __restrict__ activation,  // [K]
     const uint32_t* __restrict__ qweight,   // [K, N/8]
     const __half* __restrict__ scales,      // [K/G, N]
     const uint32_t* __restrict__ qzeros,    // [K/G, N/8]
     __half* __restrict__ output,            // [N]
-    size_t M, size_t K, size_t N, size_t G) {
+    size_t M, size_t K, size_t N, size_t G,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids, const float* __restrict__ topk_weights,
+    int top_k, int num_valid_tokens, bool mul_routed_weight,
+    size_t expert_stride_w, size_t expert_stride_s, size_t expert_stride_z) {
   static_assert(OUTPUT_PER_THREAD == 8,
                 "Split-K only supports OUTPUT_PER_THREAD=8");
   static_assert(SPLIT_K >= 1 && SPLIT_K <= 20,
@@ -160,6 +170,21 @@ __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
       reinterpret_cast<size_t>(scales) + col_start * sizeof(__half);
 
   const __half* act_ptr = activation + start_row;
+
+  if constexpr (MOE == MixtureOfExperts::YES) {
+    // TODO: Look up token_id from sorted_token_ids[blockIdx.y],
+    // skip padding, resolve expert_id, offset weight/scale/zero
+    // pointers by expert strides, set activation pointer.
+    (void)sorted_token_ids;
+    (void)expert_ids;
+    (void)topk_weights;
+    (void)top_k;
+    (void)num_valid_tokens;
+    (void)mul_routed_weight;
+    (void)expert_stride_w;
+    (void)expert_stride_s;
+    (void)expert_stride_z;
+  }
 
   // Simplified pointer arithmetic with memory clobber to limit cross-iteration
   // optimization The asm barrier prevents the compiler from over-optimizing
@@ -441,6 +466,10 @@ __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
 
   // For SPLIT_K=1, no reduction needed - write directly to output and return
   if constexpr (SPLIT_K == 1) {
+    if constexpr (MOE == MixtureOfExperts::YES) {
+      // TODO: Write to output[token_id * N + col], optionally
+      // multiply by topk_weights[token_id].
+    }
   #pragma unroll
     for (int i = 0; i < OUTPUT_PER_THREAD; i++) {
       size_t col = col_start + i;
@@ -524,6 +553,10 @@ __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
       }
 
       // Write outputs (convert fp32 accumulators to fp16)
+      if constexpr (MOE == MixtureOfExperts::YES) {
+        // TODO: Write to output[token_id * N + col], optionally
+        // multiply by topk_weights[token_id].
+      }
   #pragma unroll
       for (int i = 0; i < OUTPUT_PER_THREAD; i++) {
         size_t col = col_start + i;
@@ -548,6 +581,10 @@ __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
       }
 
       // Write outputs (convert fp32 accumulators to fp16)
+      if constexpr (MOE == MixtureOfExperts::YES) {
+        // TODO: Write to output[token_id * N + col], optionally
+        // multiply by topk_weights[token_id].
+      }
   #pragma unroll
       for (int i = 0; i < OUTPUT_PER_THREAD; i++) {
         size_t col = col_start + i;
@@ -558,6 +595,122 @@ __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
     }
   }
 }
+
+// ============================================================================
+// Shared helpers for split-K selection and dispatch
+// ============================================================================
+
+static int64_t compute_effective_splitk(int64_t split_k, int64_t num_groups,
+                                        int64_t N) {
+  int64_t effective_splitk;
+  if (split_k > 0) {
+    effective_splitk = split_k;
+  } else {
+    int64_t target_groups_per_split;
+    if (N <= 4096) {
+      target_groups_per_split = 2;
+    } else if (N <= 16384) {
+      target_groups_per_split = 4;
+    } else {
+      target_groups_per_split = 5;
+    }
+    int64_t target_sk =
+        std::max(int64_t(1), num_groups / target_groups_per_split);
+    target_sk = std::min(target_sk, int64_t(20));
+
+    effective_splitk = 1;
+    for (int64_t sk = target_sk; sk >= 1; sk--) {
+      if (num_groups % sk == 0) {
+        effective_splitk = sk;
+        break;
+      }
+    }
+  }
+
+  effective_splitk = std::min(effective_splitk, int64_t(20));
+  if (effective_splitk < 1 || num_groups % effective_splitk != 0) {
+    int64_t orig = std::max(effective_splitk, int64_t(1));
+    effective_splitk = 1;
+    for (int64_t sk = std::min(orig, int64_t(20)); sk >= 1; sk--) {
+      if (num_groups % sk == 0) {
+        effective_splitk = sk;
+        break;
+      }
+    }
+  }
+
+  return effective_splitk;
+}
+
+template <typename LaunchFn>
+static void dispatch_splitk(int64_t effective_splitk, LaunchFn&& launch) {
+  switch (effective_splitk) {
+    case 20:
+      launch.template operator()<20>();
+      break;
+    case 19:
+      launch.template operator()<19>();
+      break;
+    case 18:
+      launch.template operator()<18>();
+      break;
+    case 17:
+      launch.template operator()<17>();
+      break;
+    case 16:
+      launch.template operator()<16>();
+      break;
+    case 15:
+      launch.template operator()<15>();
+      break;
+    case 14:
+      launch.template operator()<14>();
+      break;
+    case 13:
+      launch.template operator()<13>();
+      break;
+    case 12:
+      launch.template operator()<12>();
+      break;
+    case 11:
+      launch.template operator()<11>();
+      break;
+    case 10:
+      launch.template operator()<10>();
+      break;
+    case 9:
+      launch.template operator()<9>();
+      break;
+    case 8:
+      launch.template operator()<8>();
+      break;
+    case 7:
+      launch.template operator()<7>();
+      break;
+    case 6:
+      launch.template operator()<6>();
+      break;
+    case 5:
+      launch.template operator()<5>();
+      break;
+    case 4:
+      launch.template operator()<4>();
+      break;
+    case 3:
+      launch.template operator()<3>();
+      break;
+    case 2:
+      launch.template operator()<2>();
+      break;
+    default:
+      launch.template operator()<1>();
+      break;
+  }
+}
+
+// ============================================================================
+// Host functions
+// ============================================================================
 
 template <PackingOrder PACKING>
 torch::Tensor awq_gemv_hip_impl(torch::Tensor activation,  // [M, K] or [K]
@@ -661,51 +814,7 @@ torch::Tensor awq_gemv_hip_impl(torch::Tensor activation,  // [M, K] or [K]
   int64_t total_outputs = (N + OUTPUT_PER_THREAD - 1) / OUTPUT_PER_THREAD;
   constexpr int THREADS_PER_SPLIT = 32;
 
-  // Determine effective split-k: use passed value, or fall back to heuristic
-  int64_t effective_splitk;
-  if (split_k > 0) {
-    // Explicit split-k from Python config
-    effective_splitk = split_k;
-  } else {
-    // Fallback heuristic: find the largest divisor of num_groups (up to 20)
-    // that provides good parallelism without excessive overhead.
-    // Target: ~4-8 groups per split for good balance of parallelism vs.
-    // reduction overhead, scaled by N (larger N needs less K-parallelism).
-    int64_t target_groups_per_split;
-    if (N <= 4096) {
-      target_groups_per_split = 2;  // small N: maximize K-parallelism
-    } else if (N <= 16384) {
-      target_groups_per_split = 4;
-    } else {
-      target_groups_per_split = 5;  // large N: less K-parallelism needed
-    }
-    int64_t target_sk =
-        std::max(int64_t(1), num_groups / target_groups_per_split);
-    target_sk = std::min(target_sk, int64_t(20));
-
-    // Find the largest divisor of num_groups that is <= target_sk
-    effective_splitk = 1;
-    for (int64_t sk = target_sk; sk >= 1; sk--) {
-      if (num_groups % sk == 0) {
-        effective_splitk = sk;
-        break;
-      }
-    }
-  }
-
-  // Validate: effective_splitk must be in [1, 20] and divide num_groups.
-  // If not, find the largest value <= effective_splitk that divides num_groups.
-  effective_splitk = std::min(effective_splitk, int64_t(20));
-  if (effective_splitk < 1 || num_groups % effective_splitk != 0) {
-    int64_t orig = std::max(effective_splitk, int64_t(1));
-    effective_splitk = 1;  // safe default
-    for (int64_t sk = std::min(orig, int64_t(20)); sk >= 1; sk--) {
-      if (num_groups % sk == 0) {
-        effective_splitk = sk;
-        break;
-      }
-    }
-  }
+  int64_t effective_splitk = compute_effective_splitk(split_k, num_groups, N);
 
   // Helper to launch the kernel with a specific SPLIT_K
   auto launch = [&]<int SPLIT_K>() {
@@ -716,7 +825,7 @@ torch::Tensor awq_gemv_hip_impl(torch::Tensor activation,  // [M, K] or [K]
                                            OUTPUT_PER_THREAD * sizeof(float)
                                      : 0;
 
-    awq_gemv_kernel_splitk<8, SPLIT_K, PACKING>
+    awq_gemv_kernel_splitk<8, SPLIT_K, PACKING, MixtureOfExperts::NO>
         <<<num_blocks, THREADS_PER_BLOCK, smem_size, stream>>>(
             reinterpret_cast<const __half*>(act_flat.data_ptr<at::Half>()),
             reinterpret_cast<const uint32_t*>(qweight.data_ptr<int32_t>()),
@@ -724,72 +833,11 @@ torch::Tensor awq_gemv_hip_impl(torch::Tensor activation,  // [M, K] or [K]
             reinterpret_cast<const uint32_t*>(qzeros.data_ptr<int32_t>()),
             reinterpret_cast<__half*>(output.data_ptr<at::Half>()), 1,
             static_cast<size_t>(K), static_cast<size_t>(N),
-            static_cast<size_t>(G));
+            static_cast<size_t>(G), nullptr, nullptr, nullptr, 0, 0, false, 0,
+            0, 0);
   };
 
-  // Dispatch to the appropriate template instantiation (1-20)
-  switch (effective_splitk) {
-    case 20:
-      launch.template operator()<20>();
-      break;
-    case 19:
-      launch.template operator()<19>();
-      break;
-    case 18:
-      launch.template operator()<18>();
-      break;
-    case 17:
-      launch.template operator()<17>();
-      break;
-    case 16:
-      launch.template operator()<16>();
-      break;
-    case 15:
-      launch.template operator()<15>();
-      break;
-    case 14:
-      launch.template operator()<14>();
-      break;
-    case 13:
-      launch.template operator()<13>();
-      break;
-    case 12:
-      launch.template operator()<12>();
-      break;
-    case 11:
-      launch.template operator()<11>();
-      break;
-    case 10:
-      launch.template operator()<10>();
-      break;
-    case 9:
-      launch.template operator()<9>();
-      break;
-    case 8:
-      launch.template operator()<8>();
-      break;
-    case 7:
-      launch.template operator()<7>();
-      break;
-    case 6:
-      launch.template operator()<6>();
-      break;
-    case 5:
-      launch.template operator()<5>();
-      break;
-    case 4:
-      launch.template operator()<4>();
-      break;
-    case 3:
-      launch.template operator()<3>();
-      break;
-    case 2:
-      launch.template operator()<2>();
-      break;
-    default:
-      launch.template operator()<1>();
-      break;
-  }
+  dispatch_splitk(effective_splitk, launch);
 
   return output;
 }
