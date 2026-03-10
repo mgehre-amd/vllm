@@ -208,6 +208,12 @@ torch::Tensor permute_cols(torch::Tensor const& A, torch::Tensor const& perm);
 torch::Tensor awq_gemv_hip(torch::Tensor activation, torch::Tensor qweight,
                            torch::Tensor scales, torch::Tensor qzeros,
                            int64_t split_k);
+
+void awq_gemv_moe_hip(torch::Tensor activation, torch::Tensor qweight,
+                      torch::Tensor scales, torch::Tensor qzeros,
+                      torch::Tensor output, torch::Tensor sorted_token_ids,
+                      torch::Tensor expert_ids, torch::Tensor topk_weights,
+                      int64_t top_k, bool mul_routed_weight, int64_t split_k);
 #endif
 
 torch::Tensor ggml_dequantize(torch::Tensor W, int64_t type, int64_t m,
