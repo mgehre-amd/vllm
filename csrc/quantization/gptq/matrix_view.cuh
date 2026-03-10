@@ -14,6 +14,30 @@ https://github.com/turboderp/exllama
 namespace vllm {
 namespace gptq {
 
+// Non-temporal load: bypasses L1/L2 ROCm, uses read-only cache on
+// CUDA.  Works for any naturally-aligned ≤ 4-byte scalar type.
+template <typename T>
+__device__ __forceinline__ T nt_load(const T* addr) {
+#ifdef USE_ROCM
+  return __builtin_nontemporal_load(addr);
+#else
+  return __ldg(addr);
+#endif
+}
+
+// 128-bit (int4) non-temporal load – decomposed into 4 × 32-bit scalar loads
+// on ROCm for correctness; single __ldg on CUDA.
+__device__ __forceinline__ int4 nt_load_int4(const int4* addr) {
+#ifdef USE_ROCM
+  const int* p = reinterpret_cast<const int*>(addr);
+  return make_int4(
+      __builtin_nontemporal_load(p), __builtin_nontemporal_load(p + 1),
+      __builtin_nontemporal_load(p + 2), __builtin_nontemporal_load(p + 3));
+#else
+  return __ldg(addr);
+#endif
+}
+
 class MatrixView_half {
  public:
   const half* data;
@@ -52,6 +76,19 @@ class MatrixView_half {
     half2* ptr = (half2*)item_ptr(row, column);
     half2 i01 = ptr[0];
     half2 i23 = ptr[1];
+    items[0] = __half2float(__low2half(i01));
+    items[1] = __half2float(__high2half(i01));
+    items[2] = __half2float(__low2half(i23));
+    items[3] = __half2float(__high2half(i23));
+  }
+  __device__ __forceinline__ void item4_f_nt(float (&items)[4], int row,
+                                             int column) const {
+    const uint32_t* ptr =
+        reinterpret_cast<const uint32_t*>(item_ptr(row, column));
+    uint32_t raw0 = nt_load(ptr);
+    uint32_t raw1 = nt_load(ptr + 1);
+    half2 i01 = *reinterpret_cast<const half2*>(&raw0);
+    half2 i23 = *reinterpret_cast<const half2*>(&raw1);
     items[0] = __half2float(__low2half(i01));
     items[1] = __half2float(__high2half(i01));
     items[2] = __half2float(__low2half(i23));
@@ -134,6 +171,15 @@ class MatrixView_q4_row {
                                         int column) const {
     int shift = (column & 0x07) * 4;
     uint32_t d = data[row * width / 8 + column / 8] >> shift;
+    items[0] = d & 0x0f;
+    items[1] = (d >> 4) & 0x0f;
+    items[2] = (d >> 8) & 0x0f;
+    items[3] = (d >> 12) & 0x0f;
+  }
+  __device__ __forceinline__ void item4_nt(int (&items)[4], int row,
+                                           int column) const {
+    int shift = (column & 0x07) * 4;
+    uint32_t d = nt_load(&data[row * width / 8 + column / 8]) >> shift;
     items[0] = d & 0x0f;
     items[1] = (d >> 4) & 0x0f;
     items[2] = (d >> 8) & 0x0f;

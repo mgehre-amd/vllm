@@ -257,8 +257,8 @@ __device__ __forceinline__ void gemm_half_q_half_gptq_4bit_device(
   float scales[4];
   half2 z1z16[4][2];
   half2 y1y16[4][2];
-  b_gptq_qzeros_.item4(zeros, group, n);
-  b_gptq_scales_.item4_f(scales, group, n);
+  b_gptq_qzeros_.item4_nt(zeros, group, n);
+  b_gptq_scales_.item4_f_nt(scales, group, n);
   dequant_4bit_8_prep_zero(zeros[0] + zero_offset, z1z16[0], y1y16[0]);
   dequant_4bit_8_prep_zero(zeros[1] + zero_offset, z1z16[1], y1y16[1]);
   dequant_4bit_8_prep_zero(zeros[2] + zero_offset, z1z16[2], y1y16[2]);
@@ -273,8 +273,8 @@ __device__ __forceinline__ void gemm_half_q_half_gptq_4bit_device(
     if (k == nextgroup) {
       group++;
       nextgroup += groupsize;
-      b_gptq_qzeros_.item4(zeros, group, n);
-      b_gptq_scales_.item4_f(scales, group, n);
+      b_gptq_qzeros_.item4_nt(zeros, group, n);
+      b_gptq_scales_.item4_f_nt(scales, group, n);
       dequant_4bit_8_prep_zero(zeros[0] + zero_offset, z1z16[0], y1y16[0]);
       dequant_4bit_8_prep_zero(zeros[1] + zero_offset, z1z16[1], y1y16[1]);
       dequant_4bit_8_prep_zero(zeros[2] + zero_offset, z1z16[2], y1y16[2]);
@@ -283,8 +283,8 @@ __device__ __forceinline__ void gemm_half_q_half_gptq_4bit_device(
 
 #pragma unroll
     for (int j = 0; j < 4; j++) {
-      const int4* b_ptr4 = (int4*)b_ptr;
-      int4 load_int4 = *b_ptr4;
+      const int4* b_ptr4 = (const int4*)b_ptr;
+      int4 load_int4 = nt_load_int4(b_ptr4);
 
       half2 dq[4][4];
       dequant_4bit_8_gptq(load_int4.x, dq[0], z1z16[0], y1y16[0], size_n,
