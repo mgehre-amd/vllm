@@ -40,6 +40,9 @@ from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
     MarlinExperts,
     fused_marlin_moe,
 )
+from vllm.model_executor.layers.fused_moe.hip_w4a16_experts import (
+    HipW4A16Experts,
+)
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEKernel,
 )
@@ -1819,7 +1822,9 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         import vllm.envs as envs
 
-        if envs.VLLM_MOE_GPTQ_EXLLAMA and self.num_bits == 4:
+        if envs.VLLM_MOE_AWQ_GEMV_HIP and self.num_bits == 4:
+            self._process_weights_awq_gemv(layer)
+        elif envs.VLLM_MOE_GPTQ_EXLLAMA and self.num_bits == 4:
             # Exllama MoE path: keep weights in [E, K/8, N] int32 format
             # and apply gptq_shuffle for the exllama kernel's SIMD layout.
             from vllm._custom_ops import gptq_shuffle
@@ -1894,6 +1899,96 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             )
             layer.use_exllama_moe = False
 
+    def _process_weights_awq_gemv(self, layer: torch.nn.Module) -> None:
+        """AWQ GEMV MoE path: convert GPTQ [E, K/8, N] → AWQ [E, K, N/8]
+        and replace weights in-place (single copy in memory)."""
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            awq_pack,
+            unpack_quantized_values_into_int32,
+        )
+        from vllm.scalar_type import scalar_types
+
+        wtype = scalar_types.uint4
+        device = layer.w13_weight_packed.device
+
+        def convert_weights(w_packed: torch.Tensor) -> torch.Tensor:
+            """Convert [E, K/8, N] GPTQ → [E, K, N/8] AWQ."""
+            E, _, N = w_packed.shape
+            experts = []
+            for e in range(E):
+                unpacked = unpack_quantized_values_into_int32(
+                    w_packed[e], wtype, packed_dim=0
+                )
+                K_full = unpacked.shape[0]
+                repacked = awq_pack(unpacked, wtype.size_bits, K_full, N)
+                experts.append(repacked)
+            return torch.stack(experts)
+
+        E = layer.w13_weight_packed.size(0)
+        N_w13 = layer.w13_weight_packed.size(2)
+        N_w2 = layer.w2_weight_packed.size(2)
+        groups_w13 = layer.w13_weight_scale.size(1)
+        groups_w2 = layer.w2_weight_scale.size(1)
+
+        # Convert weights: [E, K/8, N] → [E, K, N/8] and replace in-place
+        replace_parameter(
+            layer,
+            "w13_weight_packed",
+            torch.nn.Parameter(
+                convert_weights(layer.w13_weight_packed), requires_grad=False
+            ),
+        )
+        replace_parameter(
+            layer,
+            "w2_weight_packed",
+            torch.nn.Parameter(
+                convert_weights(layer.w2_weight_packed), requires_grad=False
+            ),
+        )
+
+        # Synthetic qzeros in AWQ format
+        # Symmetric 4-bit zero_point = 8.  All nibbles identical, so AWQ
+        # interleaving has no effect: 8 nibbles of 8 → 0x88888888.
+        PACKED_ZERO_8 = 0x88888888 - 0x100000000  # signed int32
+        layer.register_parameter(
+            "w13_qzeros",
+            torch.nn.Parameter(
+                torch.full(
+                    (E, groups_w13, N_w13 // 8),
+                    PACKED_ZERO_8,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                requires_grad=False,
+            ),
+        )
+        layer.register_parameter(
+            "w2_qzeros",
+            torch.nn.Parameter(
+                torch.full(
+                    (E, groups_w2, N_w2 // 8),
+                    PACKED_ZERO_8,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                requires_grad=False,
+            ),
+        )
+
+        # Scales stay as [E, groups, N] — same layout for AWQ kernel.
+        layer.use_awq_gemv_moe = True
+
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        assert self.moe_quant_config is not None
+        layer.w13_weight = layer.w13_weight_packed
+        layer.w2_weight = layer.w2_weight_packed
+        self.moe_mk = FusedMoEKernel(
+            fused_experts=HipW4A16Experts(
+                moe_config=self.moe, quant_config=self.moe_quant_config
+            ),
+            prepare_finalize=MoEPrepareAndFinalizeNoDPEPModular(),
+        )
+
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
@@ -1905,11 +2000,13 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         )
 
         use_exllama = getattr(layer, "use_exllama_moe", False)
+        use_awq_gemv = getattr(layer, "use_awq_gemv_moe", False)
+        has_qzeros = use_exllama or use_awq_gemv
         return config_builder(
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            w1_zp=getattr(layer, "w13_qzeros", None) if use_exllama else None,
-            w2_zp=getattr(layer, "w2_qzeros", None) if use_exllama else None,
+            w1_zp=getattr(layer, "w13_qzeros", None) if has_qzeros else None,
+            w2_zp=getattr(layer, "w2_qzeros", None) if has_qzeros else None,
             block_shape=[0, self.group_size],
         )
 

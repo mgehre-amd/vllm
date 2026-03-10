@@ -101,6 +101,7 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
+    VLLM_MOE_AWQ_GEMV_HIP: bool = False
     VLLM_MOE_GPTQ_EXLLAMA: bool = False
     VLLM_ROCM_USE_MOE_WNA16_CUDA_KERNEL: bool = False
     VLLM_ROCM_USE_AITER: bool = False
@@ -921,6 +922,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
         os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")
+    ),
+    # Use AWQ GEMV HIP kernel for MoE decode on ROCm (RDNA3/3.5).
+    "VLLM_MOE_AWQ_GEMV_HIP": lambda: (
+        os.getenv("VLLM_MOE_AWQ_GEMV_HIP", "false").lower() in ("true", "1")
     ),
     # Use exllama 4-bit kernel for MoE GPTQ instead of Triton.
     # Requires exllama-native weight format [E, K/8, N] int32.
