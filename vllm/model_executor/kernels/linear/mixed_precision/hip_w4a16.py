@@ -51,8 +51,11 @@ class HipW4A16LinearKernel(MPLinearKernel):
         if c.act_type != torch.float16:
             return False, "HipW4A16LinearKernel supports float16 activations only"
 
-        if c.group_size != 128:
-            return False, "HipW4A16LinearKernel supports group size of 128 only"
+        if c.group_size < 16 or c.group_size % 16 != 0:
+            return False, (
+                "HipW4A16LinearKernel requires group size that is a positive "
+                f"multiple of 16, got {c.group_size}"
+            )
 
         full_k, full_n = c.full_weight_shape
         part_k, part_n = c.partition_weight_shape

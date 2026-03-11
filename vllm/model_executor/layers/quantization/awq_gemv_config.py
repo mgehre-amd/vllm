@@ -161,7 +161,7 @@ def _find_nearest_split_k(config: dict[tuple[int, int], int], K: int, N: int) ->
     return best_sk
 
 
-def get_awq_gemv_split_k(K: int, N: int) -> int:
+def get_awq_gemv_split_k(K: int, N: int, group_size: int = 128) -> int:
     """Get the optimal split-k value for AWQ GEMV given dimensions K and N.
 
     Checks (in priority order):
@@ -169,17 +169,27 @@ def get_awq_gemv_split_k(K: int, N: int) -> int:
     2. Device-specific config file (exact (K, N) match, or nearest neighbor)
     3. Default heuristic (based on N) when no config file exists
 
+    The JSON configs and nearest-neighbor heuristic were tuned for
+    group_size=128. For other group sizes, return 0 (auto) to let the
+    C++ kernel's internal heuristic choose. The env var override still
+    applies regardless of group size (for manual tuning sweeps).
+    TODO: expand JSON configs to cover other group sizes explicitly.
+
     Args:
         K: Input/reduction dimension (before any padding).
         N: Output dimension of the GEMV operation.
+        group_size: Quantization group size (default 128).
 
     Returns:
-        The split-k value to use (1, 2, 4, 8, or 16).
+        The split-k value to use (1, 2, 4, 8, or 16), or 0 for auto.
     """
     # Priority 1: Environment variable override (for tuning sweeps)
     env_split_k = os.environ.get("AWQ_GEMV_SPLIT_K")
     if env_split_k is not None:
         return int(env_split_k)
+
+    if group_size != 128:
+        return 0
 
     # Priority 2: Device config file
     config = get_awq_gemv_config()
@@ -216,7 +226,11 @@ def compute_awq_gemv_padding(
     Returns:
         Tuple of (should_pad, padded_groups, split_k).
     """
-    target_split_k = get_awq_gemv_split_k(K, N)
+    group_size = K // num_groups if num_groups > 0 else K
+    target_split_k = get_awq_gemv_split_k(K, N, group_size)
+
+    if target_split_k == 0:
+        return False, num_groups, 0
 
     if num_groups % target_split_k == 0:
         return False, num_groups, target_split_k

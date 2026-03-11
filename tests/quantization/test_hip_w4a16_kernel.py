@@ -42,6 +42,7 @@ def _ensure_single_process_model_parallel() -> None:
             ensure_model_parallel_initialized(1, 1)
 
 
+@pytest.mark.parametrize("group_size", [16, 32, 64, 128])
 @pytest.mark.parametrize(
     ("weight_type", "zero_points"),
     [
@@ -51,17 +52,17 @@ def _ensure_single_process_model_parallel() -> None:
 )
 @pytest.mark.parametrize("act_dtype", [torch.float16])  # TODO: +torch.bfloat16
 def test_hip_w4a16_can_implement_happy_path(
-    act_dtype, weight_type, zero_points, monkeypatch
+    act_dtype, weight_type, zero_points, group_size, monkeypatch
 ):
     monkeypatch.setattr(
         ops, "hip_w4a16_linear_kernel_apply_weights", lambda *a, **kw: None
     )
     config = MPLinearLayerConfig(
-        full_weight_shape=(4096, 4096),
-        partition_weight_shape=(4096, 4096),
+        full_weight_shape=(2560, 2560),
+        partition_weight_shape=(2560, 2560),
         weight_type=weight_type,
         act_type=act_dtype,
-        group_size=128,
+        group_size=group_size,
         zero_points=zero_points,
         has_g_idx=False,
         out_type=None,
@@ -102,7 +103,9 @@ def test_hip_w4a16_can_implement_fails_without_op(monkeypatch):
         {"weight_type": scalar_types.uint4, "zero_points": False},
         {"act_type": torch.float32},
         {"group_size": 0},
-        {"group_size": 64},
+        {"group_size": 7},
+        {"group_size": -1},
+        {"group_size": 15},
         {"has_g_idx": True},
         {"out_type": torch.float32},
     ],
@@ -129,21 +132,28 @@ def test_hip_w4a16_can_implement_rejects_invalid_configs(overrides, monkeypatch)
 
 
 @pytest.mark.parametrize(
-    ("input_shape", "expected_shape"),
+    ("group_size", "input_shape", "expected_shape"),
     [
-        ((8, 128 * 1), (8, 128 * 1)),  # minimum shape
-        ((2048, 128 * 1), (2048, 128 * 1)),  # too much overhead
-        ((2048, 128 * 15), (2048, 128 * 16)),  # pads to sk=16
-        ((2048, 128 * 17), (2048, 128 * 17)),  # no viable padding
-        ((8192, 128 * 22), (8192, 128 * 24)),  # pads to sk=8
-        ((12288, 128 * 20), (12288, 128 * 20)),  # already divisible
-        ((16384, 128 * 15), (16384, 128 * 16)),  # pads to sk=8
-        ((24576, 128 * 15), (24576, 128 * 16)),  # pads to sk=4
-        ((24576, 128 * 22), (24576, 128 * 24)),  # pads to sk=4
+        (32, (2048, 32 * 15), (2048, 32 * 15)),  # 15 groups, split_k=0 (auto), no pad
+        (32, (2048, 32 * 16), (2048, 32 * 16)),  # 16 groups, split_k=0 (auto), no pad
+        (32, (2048, 32 * 20), (2048, 32 * 20)),  # 20 groups, split_k=0 (auto), no pad
+        (32, (8192, 32 * 22), (8192, 32 * 22)),  # 22 groups, split_k=0 (auto), no pad
+        (32, (2048, 32 * 80), (2048, 32 * 80)),  # 80 groups, split_k=0 (auto), no pad
+        (128, (8, 128 * 1), (8, 128 * 1)),  # minimum shape
+        (128, (2048, 128 * 1), (2048, 128 * 1)),  # too much overhead
+        (128, (2048, 128 * 15), (2048, 128 * 16)),  # pads to sk=16
+        (128, (2048, 128 * 17), (2048, 128 * 17)),  # no viable padding
+        (128, (8192, 128 * 22), (8192, 128 * 24)),  # pads to sk=8
+        (128, (12288, 128 * 20), (12288, 128 * 20)),  # already divisible
+        (128, (16384, 128 * 15), (16384, 128 * 16)),  # pads to sk=8
+        (128, (24576, 128 * 15), (24576, 128 * 16)),  # pads to sk=4
+        (128, (24576, 128 * 22), (24576, 128 * 24)),  # pads to sk=4
     ],
 )
 @pytest.mark.parametrize("act_dtype", [torch.float16])  # TODO: +torch.bfloat16
-def test_hip_w4a16_process_shapes(input_shape, expected_shape, act_dtype, monkeypatch):
+def test_hip_w4a16_process_shapes(
+    group_size, input_shape, expected_shape, act_dtype, monkeypatch
+):
     monkeypatch.setattr(
         ops, "hip_w4a16_linear_kernel_apply_weights", lambda *a, **kw: None
     )
@@ -157,7 +167,6 @@ def test_hip_w4a16_process_shapes(input_shape, expected_shape, act_dtype, monkey
     device = "cpu"
 
     _ensure_single_process_model_parallel()
-    group_size = 128
     pack_factor = 8
     input_n, input_k = input_shape
     expected_n, expected_k = expected_shape
@@ -238,7 +247,16 @@ def test_hip_w4a16_process_shapes(input_shape, expected_shape, act_dtype, monkey
     )
 
 
-def test_hip_w4a16_env_split_k_override(monkeypatch):
+@pytest.mark.parametrize(
+    ("group_size", "input_k", "config_dict", "expected_packed_k"),
+    [
+        (32, 224, {(224, 2048): 4}, 256),
+        (128, 896, {(896, 2048): 7}, 1024),
+    ],
+)
+def test_hip_w4a16_env_split_k_override(
+    group_size, input_k, config_dict, expected_packed_k, monkeypatch
+):
     monkeypatch.setattr(
         ops, "hip_w4a16_linear_kernel_apply_weights", lambda *a, **kw: None
     )
@@ -246,15 +264,18 @@ def test_hip_w4a16_env_split_k_override(monkeypatch):
     monkeypatch.setattr(
         awq_gemv_config,
         "get_awq_gemv_config",
-        lambda: {(896, 2048): 7},
+        lambda: config_dict,
     )
     monkeypatch.setenv("AWQ_GEMV_SPLIT_K", "8")
+
+    # Env var must override the group_size!=128 bypass too.
+    assert awq_gemv_config.get_awq_gemv_split_k(input_k, 2048, group_size) == 8
+
     device = "cpu"
 
     _ensure_single_process_model_parallel()
-    group_size = 128
     pack_factor = 8
-    input_n, input_k = (2048, 896)
+    input_n = 2048
 
     config = MPLinearLayerConfig(
         full_weight_shape=(input_k, input_n),
@@ -321,6 +342,32 @@ def test_hip_w4a16_env_split_k_override(monkeypatch):
     )
     kernel.process_weights_after_loading(layer)
 
-    # num_groups = 896 / 128 = 7. split_k=8 forces padding to 8 groups.
+    # split_k=8 forces padding when num_groups isn't divisible by 8.
     assert kernel._split_k == 8
-    assert layer.weight_packed.shape == (1024, input_n // pack_factor)
+    assert layer.weight_packed.shape == (expected_packed_k, input_n // pack_factor)
+
+
+@pytest.mark.parametrize(
+    ("group_size", "K", "N"),
+    [
+        (32, 2560, 2560),
+        (32, 4096, 4096),
+        (32, 4096, 11008),
+        (64, 4096, 4096),
+    ],
+)
+def test_compute_awq_gemv_padding_non128_group_size(group_size, K, N, monkeypatch):
+    """group_size != 128 should always return split_k=0, no padding."""
+    monkeypatch.delenv("AWQ_GEMV_SPLIT_K", raising=False)
+    monkeypatch.setattr(
+        awq_gemv_config,
+        "get_awq_gemv_config",
+        lambda: None,
+    )
+    num_groups = K // group_size
+    should_pad, padded_groups, split_k = awq_gemv_config.compute_awq_gemv_padding(
+        num_groups, K, N
+    )
+    assert not should_pad
+    assert split_k == 0
+    assert padded_groups == num_groups

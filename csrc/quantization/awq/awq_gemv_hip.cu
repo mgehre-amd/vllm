@@ -34,6 +34,10 @@ enum class PackingOrder {
   AWQ,
 };
 
+// Number of K-elements processed per inner-loop iteration in the GEMV kernel.
+// G (group size) must be a positive multiple of this value.
+static constexpr int PIPELINE_DEPTH = 16;
+
 // ============================================================================
 // FP16 bit-trick dequantization helpers
 // Reinterpret a uint32 as a pair of fp16 values (__half2) via union cast.
@@ -78,7 +82,6 @@ __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
   // threads/block
   constexpr int THREADS_PER_SPLIT = 32;
   constexpr int UINT32_PER_LOAD = OUTPUT_PER_THREAD / 8;  // 1
-  constexpr int PIPELINE_DEPTH = 16;
   constexpr int ACC_HALF2_COUNT = OUTPUT_PER_THREAD / 2;  // 4
 
   // In a packed input word, this is the base shift for items 0, 2, 4, and 6.
@@ -348,7 +351,8 @@ __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
   EXTRACT_ZEROS_IN_BUF_SK(0);
   LOAD_SCALES_TO_BUF_SK(start_group, 0);
 
-  // Load first 16 weight rows (partial unroll to reduce register pressure)
+  // Load first PIPELINE_DEPTH weight rows (partial unroll to reduce register
+  // pressure)
   #pragma unroll
   for (int slot = 0; slot < PIPELINE_DEPTH; slot++) {
     global_uint32_ptr p = GET_W_PTR_SK();
@@ -586,11 +590,8 @@ torch::Tensor awq_gemv_hip_impl(torch::Tensor activation,  // [M, K] or [K]
               activation.sizes());
 
   // ========== Group size constraint ==========
-  // Kernel uses PIPELINE_DEPTH=16, so G must be divisible by 16
-  // Currently we only support G=128 for optimal performance
-  TORCH_CHECK(G == 128, "awq_gemv_hip only supports group_size=128, got ", G);
-  TORCH_CHECK(G % 16 == 0, "group_size (", G,
-              ") must be divisible by PIPELINE_DEPTH (16)");
+  TORCH_CHECK(G % PIPELINE_DEPTH == 0, "group_size (", G,
+              ") must be a positive multiple of ", PIPELINE_DEPTH);
 
   // ========== N dimension constraints ==========
   // N must be divisible by 8 for weight packing (8 int4 per uint32)

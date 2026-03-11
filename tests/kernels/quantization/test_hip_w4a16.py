@@ -101,26 +101,37 @@ def _awq_reference_output(
     ["random", "ones", "last_row", "last_col"],
 )
 @pytest.mark.parametrize(
-    ("n", "k"),
+    ("group_size", "n", "k"),
     [
-        (8, 128 * 1),  # minimum supported size
-        (2048, 128 * 1),
-        (2048, 128 * 7),
-        (2048, 128 * 15),
-        (2048, 128 * 16),
-        (2048, 128 * 17),
-        (2048, 128 * 24),
-        (2048, 128 * 27),
-        (8192, 128 * 22),
-        (8192, 128 * 24),
-        (12288, 128 * 20),
-        (12288, 128 * 21),
-        (16384, 128 * 15),
-        (16384, 128 * 22),
+        (16, 8, 16),
+        (16, 2048, 16 * 5),
+        (16, 2048, 16 * 20),
+        (32, 8, 32),
+        (32, 2048, 32 * 5),
+        (32, 2048, 32 * 16),
+        (32, 2048, 32 * 80),
+        (32, 8192, 32 * 20),
+        (64, 2048, 64 * 10),
+        (64, 2048, 64 * 20),
+        (128, 8, 128),
+        (128, 2048, 128 * 1),
+        (128, 2048, 128 * 7),
+        (128, 2048, 128 * 15),
+        (128, 2048, 128 * 16),
+        (128, 2048, 128 * 17),
+        (128, 2048, 128 * 24),
+        (128, 2048, 128 * 27),
+        (128, 8192, 128 * 22),
+        (128, 8192, 128 * 24),
+        (128, 12288, 128 * 20),
+        (128, 12288, 128 * 21),
+        (128, 16384, 128 * 15),
+        (128, 16384, 128 * 22),
     ],
 )
 @pytest.mark.parametrize("act_dtype", [torch.float16])  # TODO: +torch.bfloat16
 def test_hip_w4a16_asymmetric_correctness(
+    group_size: int,
     n: int,
     k: int,
     pattern: str,
@@ -128,7 +139,6 @@ def test_hip_w4a16_asymmetric_correctness(
     random_seed: int,
 ) -> None:
     _ensure_single_process_model_parallel()
-    group_size = 128
     pack_factor = 8
     set_random_seed(random_seed)
 
@@ -303,16 +313,24 @@ def test_hip_w4a16_asymmetric_correctness(
     torch.testing.assert_close(y, y_ref, rtol=1e-2, atol=atol)
 
 
+@pytest.mark.parametrize(
+    ("group_size", "n", "k"),
+    [
+        (32, 2048, 32 * 16),
+        (32, 2048, 32 * 80),
+        (128, 2048, 128 * 7),
+    ],
+)
 @pytest.mark.parametrize("act_dtype", [torch.float16])  # TODO: +torch.bfloat16
 def test_hip_w4a16_asymmetric_gemm_fallback_correctness(
+    group_size: int,
+    n: int,
+    k: int,
     act_dtype: torch.dtype,
     random_seed: int,
 ) -> None:
     _ensure_single_process_model_parallel()
-    n = 2048
-    k = 128 * 7
     m = 2
-    group_size = 128
     pack_factor = 8
     set_random_seed(random_seed)
 
@@ -408,14 +426,20 @@ def test_hip_w4a16_asymmetric_gemm_fallback_correctness(
 
 
 @pytest.mark.parametrize(
-    ("n", "k"),
+    ("group_size", "n", "k"),
     [
-        (2048, 128 * 16),  # no K-padding needed
-        (2048, 128 * 7),  # K-padding needed
+        (16, 2048, 16 * 20),
+        (32, 2048, 32 * 5),
+        (32, 2048, 32 * 16),
+        (32, 2048, 32 * 80),
+        (64, 2048, 64 * 10),
+        (128, 2048, 128 * 16),
+        (128, 2048, 128 * 7),
     ],
 )
 @pytest.mark.parametrize("act_dtype", [torch.float16])  # TODO: +torch.bfloat16
 def test_hip_w4a16_symmetric_correctness(
+    group_size: int,
     n: int,
     k: int,
     act_dtype: torch.dtype,
@@ -424,7 +448,6 @@ def test_hip_w4a16_symmetric_correctness(
     """Test the symmetric (zero_points=False) path where HipW4A16LinearKernel
     synthesizes an all-zero BasevLLMParameter for zero points."""
     _ensure_single_process_model_parallel()
-    group_size = 128
     pack_factor = 8
     set_random_seed(random_seed)
 
