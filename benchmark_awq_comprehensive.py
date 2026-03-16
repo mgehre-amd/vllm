@@ -248,7 +248,7 @@ def test_autoawq_correctness(autoawq_module, shapes, awq_dequantize_triton):
             )
 
             # Synchronize to catch any async errors
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
             # Compare
             diff = (output_awq - output_ref).abs()
@@ -286,7 +286,7 @@ def test_autoawq_correctness(autoawq_module, shapes, awq_dequantize_triton):
             )
             all_pass = False
             # Reset GPU state
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
     print("-" * 90)
     print(f"Overall: {'ALL PASS' if all_pass else 'SOME FAILED'}")
@@ -1130,12 +1130,17 @@ def main():
                     backend="gloo",
                 )
             if not model_parallel_is_initialized():
-                ensure_model_parallel_initialized(1, 1)
+                from vllm.config import VllmConfig, set_current_vllm_config
+
+                with set_current_vllm_config(VllmConfig()):
+                    ensure_model_parallel_initialized(1, 1)
 
         ensure_single_process_model_parallel()
-        from vllm.model_executor.layers.quantization.kernels.mixed_precision import (
-            MPLinearLayerConfig,
+        from vllm.model_executor.kernels.linear import (
             choose_mp_linear_kernel,
+        )
+        from vllm.model_executor.kernels.linear.mixed_precision import (
+            MPLinearLayerConfig,
         )
         from vllm.model_executor.parameter import (
             GroupQuantScaleParameter,
@@ -1332,16 +1337,20 @@ def main():
                     backend="gloo",
                 )
             if not model_parallel_is_initialized():
-                ensure_model_parallel_initialized(1, 1)
+                from vllm.config import VllmConfig, set_current_vllm_config
+
+                with set_current_vllm_config(VllmConfig()):
+                    ensure_model_parallel_initialized(1, 1)
 
         ensure_single_process_model_parallel()
-        from vllm.model_executor.layers.quantization.kernels.mixed_precision.hip_w4a16 import (  # noqa: E501
-            HipW4A16LinearKernel,
-        )
-
-        from vllm.model_executor.layers.quantization.kernels.mixed_precision import (
-            MPLinearLayerConfig,
+        from vllm.model_executor.kernels.linear import (
             choose_mp_linear_kernel,
+        )
+        from vllm.model_executor.kernels.linear.mixed_precision import (
+            MPLinearLayerConfig,
+        )
+        from vllm.model_executor.kernels.linear.mixed_precision.hip_w4a16 import (  # noqa: E501
+            HipW4A16LinearKernel,
         )
         from vllm.model_executor.layers.quantization.utils.quant_utils import (
             pack_quantized_values_into_int32,

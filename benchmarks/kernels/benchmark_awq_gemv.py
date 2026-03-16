@@ -219,7 +219,7 @@ def benchmark_shape(
     for _ in range(num_warmup):
         _flush_l2_cache(flush_buf)
         awq_gemv_hip(act, qweight, scales, qzeros, split_k)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     # Benchmark with CUDA events and L2 cache clearing
     start_event = torch.cuda.Event(enable_timing=True)
@@ -228,7 +228,7 @@ def benchmark_shape(
     latencies = []
     for _ in range(num_iters):
         _flush_l2_cache(flush_buf)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         start_event.record()
         awq_gemv_hip(act, qweight, scales, qzeros, split_k)

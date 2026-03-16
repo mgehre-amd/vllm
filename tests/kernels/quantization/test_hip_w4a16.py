@@ -3,14 +3,14 @@
 
 import pytest
 import torch
-from vllm.model_executor.layers.quantization.kernels.mixed_precision.hip_w4a16 import (  # noqa: E501
-    HipW4A16LinearKernel,
-)
-from vllm.model_executor.layers.quantization.kernels.mixed_precision.MPLinearKernel import (  # noqa: E501
-    MPLinearLayerConfig,
-)
 
 from tests.quantization.utils import is_quant_method_supported
+from vllm.model_executor.kernels.linear.mixed_precision.hip_w4a16 import (  # noqa: E501
+    HipW4A16LinearKernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (  # noqa: E501
+    MPLinearLayerConfig,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     pack_quantized_values_into_int32,
     unpack_quantized_values_into_int32,
@@ -38,6 +38,7 @@ pytestmark = pytest.mark.skipif(
 def _ensure_single_process_model_parallel() -> None:
     import torch.distributed as dist
 
+    from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed.parallel_state import (
         ensure_model_parallel_initialized,
         init_distributed_environment,
@@ -53,7 +54,8 @@ def _ensure_single_process_model_parallel() -> None:
             backend="gloo",
         )
     if not model_parallel_is_initialized():
-        ensure_model_parallel_initialized(1, 1)
+        with set_current_vllm_config(VllmConfig()):
+            ensure_model_parallel_initialized(1, 1)
 
 
 def _awq_reference_output(
