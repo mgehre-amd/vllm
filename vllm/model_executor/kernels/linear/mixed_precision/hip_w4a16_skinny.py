@@ -14,13 +14,101 @@ from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
 LDS_CAPACITY_ELEMENTS = 64 * 1024 // 2  # 32768 fp16 elements
 
+SKINNY_GEMM_MAX_N = 4
+
+
+def _w4a16_apply_impl(
+    x_2d: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    bias: torch.Tensor | None,
+    cu_count: int,
+    group_size: int,
+) -> torch.Tensor:
+    """Dispatch between skinny GEMM kernel and dequant fallback.
+
+    Registered as a custom op so torch.compile treats it as opaque,
+    avoiding issues with the data-dependent N<=4 branch.
+    """
+    import vllm._custom_ops as ops
+
+    N = x_2d.shape[0]
+    K = x_2d.shape[1]
+    M = w_q.shape[0]
+
+    if N <= SKINNY_GEMM_MAX_N and K * N <= LDS_CAPACITY_ELEMENTS:
+        if group_size > 0:
+            return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, bias)
+        else:
+            return ops.wvSplitK_int4(w_q, x_2d, w_s, cu_count, bias)
+
+    # Fall back to dequant + torch.linear for large batches
+    K_logical = K
+    if x_2d.dtype == torch.float16:
+        # ExLlama shuffled format: unpack from uint32
+        u32 = w_q.contiguous().view(torch.int32)
+        w_dequant = torch.empty(M, K_logical, dtype=x_2d.dtype, device=x_2d.device)
+        w_dequant[:, 0::8] = ((u32 >> 0) & 0xF).to(x_2d.dtype) - 8
+        w_dequant[:, 2::8] = ((u32 >> 4) & 0xF).to(x_2d.dtype) - 8
+        w_dequant[:, 4::8] = ((u32 >> 8) & 0xF).to(x_2d.dtype) - 8
+        w_dequant[:, 6::8] = ((u32 >> 12) & 0xF).to(x_2d.dtype) - 8
+        w_dequant[:, 1::8] = ((u32 >> 16) & 0xF).to(x_2d.dtype) - 8
+        w_dequant[:, 3::8] = ((u32 >> 20) & 0xF).to(x_2d.dtype) - 8
+        w_dequant[:, 5::8] = ((u32 >> 24) & 0xF).to(x_2d.dtype) - 8
+        w_dequant[:, 7::8] = ((u32 >> 28) & 0xF).to(x_2d.dtype) - 8
+    else:
+        packed = w_q.view(torch.uint8)
+        low = ((packed & 0xF).to(torch.int8) << 4 >> 4).to(x_2d.dtype)
+        high = (packed.to(torch.int8) >> 4).to(x_2d.dtype)
+        w_dequant = torch.empty(M, K_logical, dtype=x_2d.dtype, device=x_2d.device)
+        w_dequant[:, 0::2] = low
+        w_dequant[:, 1::2] = high
+
+    if group_size > 0:
+        num_groups = K_logical // group_size
+        w_dequant = w_dequant.view(M, num_groups, group_size)
+        w_dequant = (w_dequant * w_s.unsqueeze(-1)).view(M, K_logical)
+    else:
+        w_dequant = w_dequant * w_s.unsqueeze(1)
+
+    return torch.nn.functional.linear(x_2d, w_dequant, bias)
+
+
+def _w4a16_apply_fake(
+    x_2d: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    bias: torch.Tensor | None,
+    cu_count: int,
+    group_size: int,
+) -> torch.Tensor:
+    N = x_2d.size(0)
+    M = w_q.size(0)
+    return torch.empty((N, M), dtype=x_2d.dtype, device=x_2d.device)
+
+
+def _register_w4a16_op():
+    lib = torch.library.Library("_rocm_skinny", "DEF")
+    lib.define(
+        "w4a16_apply(Tensor x_2d, Tensor w_q, Tensor w_s, Tensor? bias,"
+        " int cu_count, int group_size) -> Tensor"
+    )
+    lib.impl("w4a16_apply", _w4a16_apply_impl, "CUDA")
+    lib.impl("w4a16_apply", _w4a16_apply_fake, "Meta")
+    return lib
+
+
+_W4A16_LIB = _register_w4a16_op()
+
 
 class HipW4A16SkinnyLinearKernel(MPLinearKernel):
     """W4A16 skinny GEMM for ROCm (gfx11) using packed int4 weights.
 
     Supports both per-channel (group_size=-1) and per-group (group_size=32/128)
     symmetric quantization. Uses wvSplitK_int4/wvSplitK_int4_g for small batch
-    sizes where activations fit in LDS.
+    sizes where activations fit in LDS, with dequant+linear fallback for larger
+    batches. Wrapped as a custom op to avoid torch.compile issues with the
+    data-dependent N<=4 branch.
     """
 
     @classmethod
@@ -112,7 +200,6 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        import vllm._custom_ops as ops
         from vllm.utils.platform_utils import num_compute_units
 
         w_q, w_s, _, _ = self._get_weight_params(layer)
@@ -128,46 +215,13 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
             else torch.profiler.record_function(f"hip_w4a16_skinny {N}x{M}x{K}")
         )
         with ctx:
-            if N <= 4 and K * N <= LDS_CAPACITY_ELEMENTS:
-                cu_count = num_compute_units()
-                if self.config.group_size > 0:
-                    output = ops.wvSplitK_int4_g(
-                        w_q, x_2d, w_s, cu_count, self.config.group_size, bias
-                    )
-                else:
-                    output = ops.wvSplitK_int4(w_q, x_2d, w_s, cu_count, bias)
-            else:
-                # Fall back to dequant + torch.linear for large batches
-                K_logical = K
-                if x.dtype == torch.float16:
-                    # ExLlama shuffled format: unpack from uint32
-                    u32 = w_q.contiguous().view(torch.int32)  # [M, K/8]
-                    w_dequant = torch.empty(
-                        M, K_logical, dtype=x.dtype, device=x.device
-                    )
-                    w_dequant[:, 0::8] = ((u32 >> 0) & 0xF).to(x.dtype) - 8
-                    w_dequant[:, 2::8] = ((u32 >> 4) & 0xF).to(x.dtype) - 8
-                    w_dequant[:, 4::8] = ((u32 >> 8) & 0xF).to(x.dtype) - 8
-                    w_dequant[:, 6::8] = ((u32 >> 12) & 0xF).to(x.dtype) - 8
-                    w_dequant[:, 1::8] = ((u32 >> 16) & 0xF).to(x.dtype) - 8
-                    w_dequant[:, 3::8] = ((u32 >> 20) & 0xF).to(x.dtype) - 8
-                    w_dequant[:, 5::8] = ((u32 >> 24) & 0xF).to(x.dtype) - 8
-                    w_dequant[:, 7::8] = ((u32 >> 28) & 0xF).to(x.dtype) - 8
-                else:
-                    packed = w_q.view(torch.uint8)
-                    low = ((packed & 0xF).to(torch.int8) << 4 >> 4).to(x.dtype)
-                    high = (packed.to(torch.int8) >> 4).to(x.dtype)
-                    w_dequant = torch.empty(
-                        M, K_logical, dtype=x.dtype, device=x.device
-                    )
-                    w_dequant[:, 0::2] = low
-                    w_dequant[:, 1::2] = high
-                if self.config.group_size > 0:
-                    num_groups = K_logical // self.config.group_size
-                    w_dequant = w_dequant.view(M, num_groups, self.config.group_size)
-                    w_dequant = (w_dequant * w_s.unsqueeze(-1)).view(M, K_logical)
-                else:
-                    w_dequant = w_dequant * w_s.unsqueeze(1)
-                output = torch.nn.functional.linear(x_2d, w_dequant, bias)
-
+            cu_count = num_compute_units()
+            output = torch.ops._rocm_skinny.w4a16_apply(
+                x_2d,
+                w_q,
+                w_s,
+                bias,
+                cu_count,
+                self.config.group_size,
+            )
         return output.reshape(out_shape)
