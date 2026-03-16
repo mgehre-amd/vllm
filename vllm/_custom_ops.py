@@ -2341,6 +2341,21 @@ def wvSplitK_int8(
     return torch.ops._rocm_C.wvSplitK_int8(a, b, scale, bias, cu_count)
 
 
+if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "wvSplitK_int8"):
+
+    @register_fake("_rocm_C::wvSplitK_int8")
+    def _wvSplitK_int8_fake(
+        in_a: torch.Tensor,
+        in_b: torch.Tensor,
+        in_scale: torch.Tensor,
+        in_bias: torch.Tensor | None,
+        CuCount: int,
+    ) -> torch.Tensor:
+        N = in_b.size(0)
+        M = in_a.size(0)
+        return torch.empty((N, M), dtype=in_b.dtype, device=in_b.device)
+
+
 def wvSplitK_int8_sweep(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2364,6 +2379,21 @@ def wvSplitK_int4(
     bias: torch.Tensor = None,
 ) -> torch.Tensor:
     return torch.ops._rocm_C.wvSplitK_int4(a, b, scale, bias, cu_count)
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "wvSplitK_int4"):
+
+    @register_fake("_rocm_C::wvSplitK_int4")
+    def _wvSplitK_int4_fake(
+        in_a: torch.Tensor,
+        in_b: torch.Tensor,
+        in_scale: torch.Tensor,
+        in_bias: torch.Tensor | None,
+        CuCount: int,
+    ) -> torch.Tensor:
+        N = in_b.size(0)
+        M = in_a.size(0)
+        return torch.empty((N, M), dtype=in_b.dtype, device=in_b.device)
 
 
 def wvSplitK_int4_sweep(
@@ -2390,6 +2420,22 @@ def wvSplitK_int4_g(
     bias: torch.Tensor = None,
 ) -> torch.Tensor:
     return torch.ops._rocm_C.wvSplitK_int4_g(a, b, scale, bias, cu_count, group_size)
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "wvSplitK_int4_g"):
+
+    @register_fake("_rocm_C::wvSplitK_int4_g")
+    def _wvSplitK_int4_g_fake(
+        in_a: torch.Tensor,
+        in_b: torch.Tensor,
+        in_scale: torch.Tensor,
+        in_bias: torch.Tensor | None,
+        CuCount: int,
+        group_size: int,
+    ) -> torch.Tensor:
+        N = in_b.size(0)
+        M = in_a.size(0)
+        return torch.empty((N, M), dtype=in_b.dtype, device=in_b.device)
 
 
 def wvSplitK_int4g_sweep(
