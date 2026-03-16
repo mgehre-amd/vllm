@@ -10,6 +10,7 @@ Usage:
     python sweep_int4g_kernel.py
     python sweep_int4g_kernel.py --batch-sizes 1 4
     python sweep_int4g_kernel.py --shapes 151936x2560
+    python sweep_int4g_kernel.py --medium   # sweep medium (hf) variant only
 """
 
 import argparse
@@ -60,6 +61,15 @@ WVPRGRPS = [8, 12, 16]
 
 GROUP_SIZE = 128
 LDS_CAPACITY = 64 * 1024 // 2
+LDS_MEDIUM = int(LDS_CAPACITY * 1.2)
+
+
+def fits_sml(K, N):
+    return K * N <= LDS_CAPACITY
+
+
+def fits_medium(K, N):
+    return K * N <= LDS_MEDIUM
 
 
 def pack_int4(values_int8):
@@ -87,11 +97,12 @@ def parse_shape(s):
     return (int(parts[0]), int(parts[1]), s)
 
 
-def run_sweep(shapes, batch_sizes, warmup, rep):
+def run_sweep(shapes, batch_sizes, warmup, rep, medium_only=False):
     cu_count = get_cu_count()
     gpu_name = torch.cuda.get_device_name(0)
     dtype = torch.float16
 
+    variant_label = "medium (hf)" if medium_only else "sml"
     total_combos = (
         len(shapes)
         * len(batch_sizes)
@@ -101,6 +112,7 @@ def run_sweep(shapes, batch_sizes, warmup, rep):
         * len(WVPRGRPS)
     )
     print(f"GPU: {gpu_name}, CU count: {cu_count}")
+    print(f"Kernel variant: {variant_label}")
     print(f"Shapes: {len(shapes)}, Batch sizes: {batch_sizes}")
     print(f"Group size: {GROUP_SIZE}")
     print(
@@ -111,7 +123,8 @@ def run_sweep(shapes, batch_sizes, warmup, rep):
     print(f"warmup={warmup}, rep={rep}")
     print()
 
-    csv_path = "/scratch/mgehre/tmp/int4g128_sweep_results.csv"
+    suffix = "_medium" if medium_only else ""
+    csv_path = f"/scratch/mgehre/tmp/int4g128_sweep{suffix}_results.csv"
     csv_file = open(csv_path, "w", newline="")  # noqa: SIM115
     writer = csv.writer(csv_file)
     writer.writerow(
@@ -143,9 +156,14 @@ def run_sweep(shapes, batch_sizes, warmup, rep):
         num_groups = K // GROUP_SIZE
 
         for N in batch_sizes:
-            if K * N > LDS_CAPACITY:
-                skipped += len(YTILES) * len(UNRLS) * len(ACHUNKS) * len(WVPRGRPS)
-                continue
+            if medium_only:
+                if fits_sml(K, N) or not fits_medium(K, N):
+                    skipped += len(YTILES) * len(UNRLS) * len(ACHUNKS) * len(WVPRGRPS)
+                    continue
+            else:
+                if not fits_sml(K, N):
+                    skipped += len(YTILES) * len(UNRLS) * len(ACHUNKS) * len(WVPRGRPS)
+                    continue
 
             values_int4 = torch.randint(-8, 8, (M, K), dtype=torch.int8, device="cuda")
             weight_packed = pack_int4(values_int4)
@@ -154,11 +172,18 @@ def run_sweep(shapes, batch_sizes, warmup, rep):
 
             weight_bytes = M * K // 2
 
+            sweep_fn = (
+                ops.wvSplitK_int4g_hf_sweep if medium_only else ops.wvSplitK_int4g_sweep
+            )
+
             shape_results = []
             for ytile, unrl, achunk, wvprgrp in itertools.product(
                 YTILES, UNRLS, ACHUNKS, WVPRGRPS
             ):
-                if M % ytile != 0 or K % achunk != 0:
+                if K % achunk != 0:
+                    skipped += 1
+                    continue
+                if not medium_only and M % ytile != 0:
                     skipped += 1
                     continue
 
@@ -170,8 +195,9 @@ def run_sweep(shapes, batch_sizes, warmup, rep):
                         wv=wvprgrp,
                         w=weight_packed,
                         a=activation,
-                        s=scale: (
-                            ops.wvSplitK_int4g_sweep(
+                        s=scale,
+                        _sf=sweep_fn: (
+                            _sf(
                                 w,
                                 a,
                                 s,
@@ -248,10 +274,10 @@ def run_sweep(shapes, batch_sizes, warmup, rep):
     print(f"Full CSV: {csv_path}")
     print()
 
-    analyze_results(csv_path, results)
+    analyze_results(csv_path, results, medium_only)
 
 
-def analyze_results(csv_path, best_per_shape):
+def analyze_results(csv_path, best_per_shape, medium_only=False):
     import collections
 
     all_rows = []
@@ -269,8 +295,9 @@ def analyze_results(csv_path, best_per_shape):
             row["wvprgrp"] = int(row["wvprgrp"])
             all_rows.append(row)
 
+    variant_label = "MEDIUM (hf)" if medium_only else "SML"
     print("=" * 100)
-    print("BEST CONFIG PER SHAPE")
+    print(f"BEST CONFIG PER SHAPE [{variant_label}]")
     print("=" * 100)
     print(
         f"{'N':>2} {'M':>6}x{'K':<6} {'Label':<22} "
@@ -413,9 +440,10 @@ def analyze_results(csv_path, best_per_shape):
         )
 
     print()
-    summary_path = "/scratch/mgehre/tmp/int4g128_sweep_summary.txt"
+    suffix = "_medium" if medium_only else ""
+    summary_path = f"/scratch/mgehre/tmp/int4g128_sweep{suffix}_summary.txt"
     with open(summary_path, "w") as f:
-        f.write("Int4 group-128 sweep summary\n")
+        f.write(f"Int4 group-128 {variant_label} sweep summary\n")
         for r in best_per_shape:
             f.write(
                 f"N={r['N']} {r['M']}x{r['K']} {r['label']}: "
@@ -441,12 +469,17 @@ def main():
         default=None,
         help="Shapes as MxK (default: all built-in shapes)",
     )
+    parser.add_argument(
+        "--medium",
+        action="store_true",
+        help="Sweep medium (hf) kernel variant for shapes where K*N exceeds sml LDS",
+    )
     parser.add_argument("--warmup", type=int, default=25, help="Warmup iterations")
     parser.add_argument("--rep", type=int, default=100, help="Benchmark repetitions")
     args = parser.parse_args()
 
     shapes = args.shapes if args.shapes else SHAPES
-    run_sweep(shapes, args.batch_sizes, args.warmup, args.rep)
+    run_sweep(shapes, args.batch_sizes, args.warmup, args.rep, medium_only=args.medium)
 
 
 if __name__ == "__main__":
