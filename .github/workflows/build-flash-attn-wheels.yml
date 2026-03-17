@@ -158,7 +158,7 @@ jobs:
       - name: Determine release tag
         id: create-tag
         run: |
-          WHEEL=$(ls dist/*.whl | head -1)
+          WHEEL=$(find dist -name '*.whl' -print -quit)
           BASENAME=$(basename "$WHEEL" .whl)
           VERSION=$(echo "$BASENAME" | sed 's/^flash_attn-//; s/-cp[0-9].*//')
           TAG="wheels/flash-attn-${VERSION}"

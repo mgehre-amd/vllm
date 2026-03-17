@@ -103,8 +103,8 @@ jobs:
           
           # List what ROCm packages are installed
           echo "=== ROCm packages in site-packages ==="
-          ls -la "$SITE_PACKAGES" | grep -i rocm || true
-          ls -la "$SITE_PACKAGES/_rocm"* 2>/dev/null || true
+          find "$SITE_PACKAGES" -maxdepth 1 -iname '*rocm*' -ls || true
+          ls -la "$SITE_PACKAGES"/_rocm* 2>/dev/null || true
           
           # Set ROCm paths based on AMD nightly wheel structure
           ROCM_PATH="$SITE_PACKAGES/_rocm_sdk_devel"
@@ -117,21 +117,23 @@ jobs:
           ls -la "$ROCM_PATH/lib/llvm/bin" 2>/dev/null || echo "Warning: ROCM_PATH/lib/llvm/bin not found"
           
           echo "=== HIP_DEVICE_LIB_PATH contents ==="
-          ls -la "$HIP_DEVICE_LIB_PATH" 2>/dev/null | head -20 || echo "Warning: HIP_DEVICE_LIB_PATH not found"
+          find "$HIP_DEVICE_LIB_PATH" -maxdepth 1 -ls 2>/dev/null | head -20 || echo "Warning: HIP_DEVICE_LIB_PATH not found"
           
           # Use amdsmi bundled in rocm-sdk-core (not the PyPI package)
           AMDSMI_PATH="$SITE_PACKAGES/_rocm_sdk_core/share/amd_smi"
           
           # Export to GITHUB_ENV for subsequent steps
-          echo "ROCM_PATH=$ROCM_PATH" >> $GITHUB_ENV
-          echo "HIP_DEVICE_LIB_PATH=$HIP_DEVICE_LIB_PATH" >> $GITHUB_ENV
-          echo "PATH=$ROCM_BIN:$PATH" >> $GITHUB_ENV
-          echo "PYTHONPATH=$AMDSMI_PATH${PYTHONPATH:+:$PYTHONPATH}" >> $GITHUB_ENV
+          {
+            echo "ROCM_PATH=$ROCM_PATH"
+            echo "HIP_DEVICE_LIB_PATH=$HIP_DEVICE_LIB_PATH"
+            echo "PATH=$ROCM_BIN:$PATH"
+            echo "PYTHONPATH=$AMDSMI_PATH${PYTHONPATH:+:$PYTHONPATH}"
+          } >> "$GITHUB_ENV"
           
           # Verify hipcc is available
           echo "=== Checking hipcc ==="
           which hipcc || echo "hipcc not found in PATH"
-          cat $(which hipcc) 2>/dev/null | head -50 || true
+          head -50 "$(which hipcc)" 2>/dev/null || true
 
       - name: Install remaining vLLM build requirements
         run: |
@@ -214,10 +216,11 @@ jobs:
       - name: Determine release tag
         id: create-tag
         run: |
+          # shellcheck disable=SC2193  # github.ref is substituted by Actions
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             TAG="${{ github.ref_name }}"
           else
-            WHEEL=$(ls dist/*.whl | head -1)
+            WHEEL=$(find dist -name '*.whl' -print -quit)
             BASENAME=$(basename "$WHEEL" .whl)
             # Extract version from wheel name: vllm-<version>-cp312-...
             VERSION=$(echo "$BASENAME" | sed 's/^vllm-//; s/-cp[0-9].*//')
