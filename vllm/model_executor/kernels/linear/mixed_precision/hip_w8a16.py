@@ -19,7 +19,7 @@ def _w8a16_apply_impl(
     x_2d: torch.Tensor,
     w_q: torch.Tensor,
     w_s: torch.Tensor,
-    w_dequant: torch.Tensor | None,
+    w_dequant: torch.Tensor,
     bias: torch.Tensor | None,
     cu_count: int,
 ) -> torch.Tensor:
@@ -36,10 +36,6 @@ def _w8a16_apply_impl(
     if K * N <= LDS_CAPACITY_ELEMENTS:
         return ops.wvSplitK_int8(w_q, x_2d, w_s, cu_count, bias)
 
-    if w_dequant is not None:
-        return torch.nn.functional.linear(x_2d, w_dequant, bias)
-
-    w_dequant = (w_q.to(x_2d.dtype) * w_s.unsqueeze(1)).contiguous()
     return torch.nn.functional.linear(x_2d, w_dequant, bias)
 
 
@@ -47,7 +43,7 @@ def _w8a16_apply_fake(
     x_2d: torch.Tensor,
     w_q: torch.Tensor,
     w_s: torch.Tensor,
-    w_dequant: torch.Tensor | None,
+    w_dequant: torch.Tensor,
     bias: torch.Tensor | None,
     cu_count: int,
 ) -> torch.Tensor:
@@ -59,7 +55,7 @@ def _w8a16_apply_fake(
 def _register_w8a16_op():
     lib = torch.library.Library("_rocm_skinny_w8", "DEF")
     lib.define(
-        "w8a16_apply(Tensor x_2d, Tensor w_q, Tensor w_s, Tensor? w_dequant,"
+        "w8a16_apply(Tensor x_2d, Tensor w_q, Tensor w_s, Tensor w_dequant,"
         " Tensor? bias, int cu_count) -> Tensor"
     )
     lib.impl("w8a16_apply", _w8a16_apply_impl, "CUDA")

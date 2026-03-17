@@ -1258,14 +1258,18 @@ torch::Tensor wvSplitK_int4g_hf_sweep(
   if (THRDS == 32) {
     if (group_size == 128) {
       SWEEP_GHF_ACHUNK(32, 128)
-    } else {
+    } else if (group_size == 32) {
       SWEEP_GHF_ACHUNK(32, 32)
+    } else {
+      TORCH_CHECK(false, "Unsupported group_size=", group_size);
     }
   } else {
     if (group_size == 128) {
       SWEEP_GHF_ACHUNK(64, 128)
-    } else {
+    } else if (group_size == 32) {
       SWEEP_GHF_ACHUNK(64, 32)
+    } else {
+      TORCH_CHECK(false, "Unsupported group_size=", group_size);
     }
   }
 
