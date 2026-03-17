@@ -498,9 +498,6 @@ class OpenVLAMultiModalProcessor(BaseMultiModalProcessor[OpenVLAProcessingInfo])
         hf_config = self.info.get_hf_config()
         # Use image_token_index (32000) as placeholder for image features
         image_token_id = getattr(hf_config, "image_token_index", 32000)
-        # Get BOS token from tokenizer
-        tokenizer = self.info.ctx.tokenizer
-        bos_token_id = tokenizer.bos_token_id
 
         def get_insertion(item_idx: int):
             num_image_tokens = self.info.get_num_image_tokens(
@@ -509,19 +506,18 @@ class OpenVLAMultiModalProcessor(BaseMultiModalProcessor[OpenVLAProcessingInfo])
             )
             image_tokens = [image_token_id] * num_image_tokens
 
-            # Return with proper token selection for embeddings
             return PromptUpdateDetails.select_token_id(
                 image_tokens,
                 embed_token_id=image_token_id,
             )
 
-        # Insert image tokens at the start of the prompt (after BOS if present)
+        # Insert image tokens at the very start of the prompt.
+        # Using start() instead of prefix([bos]) because the chat API path
+        # tokenizes without add_special_tokens, so BOS may be absent.
         return [
             PromptInsertion(
                 modality="image",
-                target=PromptIndexTargets.prefix(
-                    [bos_token_id] if bos_token_id is not None else []
-                ),
+                target=PromptIndexTargets.start(),
                 insertion=get_insertion,
             ),
         ]
