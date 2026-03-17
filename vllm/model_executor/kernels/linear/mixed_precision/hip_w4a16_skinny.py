@@ -21,6 +21,7 @@ def _w4a16_apply_impl(
     x_2d: torch.Tensor,
     w_q: torch.Tensor,
     w_s: torch.Tensor,
+    w_dequant: torch.Tensor | None,
     bias: torch.Tensor | None,
     cu_count: int,
     group_size: int,
@@ -34,7 +35,6 @@ def _w4a16_apply_impl(
 
     N = x_2d.shape[0]
     K = x_2d.shape[1]
-    M = w_q.shape[0]
 
     if N <= SKINNY_GEMM_MAX_N and K * N <= LDS_CAPACITY_ELEMENTS:
         if group_size > 0:
@@ -42,35 +42,9 @@ def _w4a16_apply_impl(
         else:
             return ops.wvSplitK_int4(w_q, x_2d, w_s, cu_count, bias)
 
-    # Fall back to dequant + torch.linear for large batches
-    K_logical = K
-    if x_2d.dtype == torch.float16:
-        # ExLlama shuffled format: unpack from uint32
-        u32 = w_q.contiguous().view(torch.int32)
-        w_dequant = torch.empty(M, K_logical, dtype=x_2d.dtype, device=x_2d.device)
-        w_dequant[:, 0::8] = ((u32 >> 0) & 0xF).to(x_2d.dtype) - 8
-        w_dequant[:, 2::8] = ((u32 >> 4) & 0xF).to(x_2d.dtype) - 8
-        w_dequant[:, 4::8] = ((u32 >> 8) & 0xF).to(x_2d.dtype) - 8
-        w_dequant[:, 6::8] = ((u32 >> 12) & 0xF).to(x_2d.dtype) - 8
-        w_dequant[:, 1::8] = ((u32 >> 16) & 0xF).to(x_2d.dtype) - 8
-        w_dequant[:, 3::8] = ((u32 >> 20) & 0xF).to(x_2d.dtype) - 8
-        w_dequant[:, 5::8] = ((u32 >> 24) & 0xF).to(x_2d.dtype) - 8
-        w_dequant[:, 7::8] = ((u32 >> 28) & 0xF).to(x_2d.dtype) - 8
-    else:
-        packed = w_q.view(torch.uint8)
-        low = ((packed & 0xF).to(torch.int8) << 4 >> 4).to(x_2d.dtype)
-        high = (packed.to(torch.int8) >> 4).to(x_2d.dtype)
-        w_dequant = torch.empty(M, K_logical, dtype=x_2d.dtype, device=x_2d.device)
-        w_dequant[:, 0::2] = low
-        w_dequant[:, 1::2] = high
-
-    if group_size > 0:
-        num_groups = K_logical // group_size
-        w_dequant = w_dequant.view(M, num_groups, group_size)
-        w_dequant = (w_dequant * w_s.unsqueeze(-1)).view(M, K_logical)
-    else:
-        w_dequant = w_dequant * w_s.unsqueeze(1)
-
+    assert w_dequant is not None, (
+        "w_dequant must be pre-computed for large-batch fallback"
+    )
     return torch.nn.functional.linear(x_2d, w_dequant, bias)
 
 
@@ -78,6 +52,7 @@ def _w4a16_apply_fake(
     x_2d: torch.Tensor,
     w_q: torch.Tensor,
     w_s: torch.Tensor,
+    w_dequant: torch.Tensor | None,
     bias: torch.Tensor | None,
     cu_count: int,
     group_size: int,
@@ -90,8 +65,8 @@ def _w4a16_apply_fake(
 def _register_w4a16_op():
     lib = torch.library.Library("_rocm_skinny", "DEF")
     lib.define(
-        "w4a16_apply(Tensor x_2d, Tensor w_q, Tensor w_s, Tensor? bias,"
-        " int cu_count, int group_size) -> Tensor"
+        "w4a16_apply(Tensor x_2d, Tensor w_q, Tensor w_s, Tensor? w_dequant,"
+        " Tensor? bias, int cu_count, int group_size) -> Tensor"
     )
     lib.impl("w4a16_apply", _w4a16_apply_impl, "CUDA")
     lib.impl("w4a16_apply", _w4a16_apply_fake, "Meta")
@@ -154,18 +129,40 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         c = self.config
+        K = c.partition_weight_shape[0]
 
+        # Dequantize from the raw unpacked representation *before* repacking
+        # into the kernel-specific layout. This is simpler than reversing the
+        # ExLlama shuffle / packed-byte format after transform_param.
+        w_q_raw, w_s_raw, _, _ = self._get_weight_params(layer)
+        unpacked = unpack_quantized_values_into_int32(
+            w_q_raw.data, c.weight_type, packed_dim=w_q_raw.packed_dim
+        )
+        bias_val = c.weight_type.bias
+        w_fp = (unpacked - bias_val).to(c.act_type)
+
+        w_s_clean = w_s_raw.data
+        if c.group_size == -1:
+            w_s_clean = w_s_clean.squeeze(-1)
+        w_s_clean = w_s_clean.contiguous()
+
+        if c.group_size > 0:
+            num_groups = K // c.group_size
+            w_fp = w_fp.view(w_fp.shape[0], num_groups, c.group_size)
+            w_fp = (w_fp * w_s_clean.unsqueeze(-1)).view(w_fp.shape[0], K)
+        else:
+            w_fp = w_fp * w_s_clean.unsqueeze(1)
+        self._w_dequant = w_fp.contiguous()
+
+        # Now repack w_q / w_s into the format the skinny GEMM kernel expects.
         def transform_w_q(x: BasevLLMParameter) -> torch.Tensor:
             unpacked = unpack_quantized_values_into_int32(
                 x.data, c.weight_type, packed_dim=x.packed_dim
             )
             if c.act_type == torch.float16:
-                # ExLlama shuffle: keep unsigned (0..15), reorder nibbles
-                # within each group of 8 for fast bitwise fp16 dequant.
-                # Layout per uint32: [k7 k5 k3 k1 | k6 k4 k2 k0] nibbles
                 unsigned = unpacked.to(torch.uint8)
-                M, K = unsigned.shape
-                g = unsigned.view(M, K // 8, 8).to(torch.int32)
+                M, K_dim = unsigned.shape
+                g = unsigned.view(M, K_dim // 8, 8).to(torch.int32)
                 shuffled = (
                     g[:, :, 0]
                     | (g[:, :, 2] << 4)
@@ -180,7 +177,7 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
             else:
                 bias_val = c.weight_type.bias
                 signed = (unpacked - bias_val).to(torch.int8)
-                M, K = signed.shape
+                M, K_dim = signed.shape
                 low = signed[:, 0::2] & 0xF
                 high = signed[:, 1::2] & 0xF
                 packed = (low | (high << 4)).to(torch.uint8)
@@ -220,6 +217,7 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
                 x_2d,
                 w_q,
                 w_s,
+                self._w_dequant,
                 bias,
                 cu_count,
                 self.config.group_size,
