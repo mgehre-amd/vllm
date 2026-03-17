@@ -15,6 +15,61 @@ from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 LDS_CAPACITY_ELEMENTS = 64 * 1024 // 2  # 32768 fp16 elements
 
 
+def _w8a16_apply_impl(
+    x_2d: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    w_dequant: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    cu_count: int,
+) -> torch.Tensor:
+    """Dispatch between skinny GEMM kernel and dequant fallback.
+
+    Registered as a custom op so torch.compile treats it as opaque,
+    avoiding issues with the data-dependent branch.
+    """
+    import vllm._custom_ops as ops
+
+    N = x_2d.shape[0]
+    K = x_2d.shape[1]
+
+    if K * N <= LDS_CAPACITY_ELEMENTS:
+        return ops.wvSplitK_int8(w_q, x_2d, w_s, cu_count, bias)
+
+    if w_dequant is not None:
+        return torch.nn.functional.linear(x_2d, w_dequant, bias)
+
+    w_dequant = (w_q.to(x_2d.dtype) * w_s.unsqueeze(1)).contiguous()
+    return torch.nn.functional.linear(x_2d, w_dequant, bias)
+
+
+def _w8a16_apply_fake(
+    x_2d: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    w_dequant: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    cu_count: int,
+) -> torch.Tensor:
+    N = x_2d.size(0)
+    M = w_q.size(0)
+    return torch.empty((N, M), dtype=x_2d.dtype, device=x_2d.device)
+
+
+def _register_w8a16_op():
+    lib = torch.library.Library("_rocm_skinny_w8", "DEF")
+    lib.define(
+        "w8a16_apply(Tensor x_2d, Tensor w_q, Tensor w_s, Tensor? w_dequant,"
+        " Tensor? bias, int cu_count) -> Tensor"
+    )
+    lib.impl("w8a16_apply", _w8a16_apply_impl, "CUDA")
+    lib.impl("w8a16_apply", _w8a16_apply_fake, "Meta")
+    return lib
+
+
+_W8A16_LIB = _register_w8a16_op()
+
+
 class HipW8A16LinearKernel(MPLinearKernel):
     """W8A16 per-channel int8 skinny GEMM for ROCm (gfx11).
 
@@ -73,13 +128,15 @@ class HipW8A16LinearKernel(MPLinearKernel):
         self._transform_param(layer, self.w_q_name, transform_w_q)
         self._transform_param(layer, self.w_s_name, transform_w_s)
 
+        w_q, w_s, _, _ = self._get_weight_params(layer)
+        self._w_dequant = (w_q.to(c.act_type) * w_s.unsqueeze(1)).contiguous()
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        import vllm._custom_ops as ops
         from vllm.utils.platform_utils import num_compute_units
 
         w_q, w_s, _, _ = self._get_weight_params(layer)
@@ -95,12 +152,13 @@ class HipW8A16LinearKernel(MPLinearKernel):
             else torch.profiler.record_function(f"hip_w8a16 {N}x{M}x{K}")
         )
         with ctx:
-            if K * N <= LDS_CAPACITY_ELEMENTS:
-                cu_count = num_compute_units()
-                output = ops.wvSplitK_int8(w_q, x_2d, w_s, cu_count, bias)
-            else:
-                raise AssertionError("hip_w8a16 does not support large batch sizes")
-                w_dequant = w_q.to(x.dtype) * w_s.unsqueeze(1)
-                output = torch.nn.functional.linear(x_2d, w_dequant, bias)
-
+            cu_count = num_compute_units()
+            output = torch.ops._rocm_skinny_w8.w8a16_apply(
+                x_2d,
+                w_q,
+                w_s,
+                self._w_dequant,
+                bias,
+                cu_count,
+            )
         return output.reshape(out_shape)
