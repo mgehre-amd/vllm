@@ -412,6 +412,11 @@ def main():
         (6144, 2560, 128),  # qkv fused (actual from profile)
         (19456, 2560, 128),  # gate_up_proj (9728 * 2)
         (2560, 9728, 128),  # down_proj
+        # Qwen3-VL-4B (hidden=2560, intermediate=9728, 32 heads, 8 kv heads, G=32)
+        (2560, 2560, 32),  # q/o proj
+        (4608, 2560, 32),  # qkv fused (2560 + 1024 + 1024)
+        (19456, 2560, 32),  # gate_up_proj (9728 * 2)
+        (2560, 9728, 32),  # down_proj
         # Qwen2.5-VL-3B (hidden=2048, intermediate=11008)
         (22016, 2048, 128),  # gate_up_proj (11008 * 2)
         (2048, 11008, 128),  # down_proj
@@ -432,7 +437,9 @@ def main():
         (22016, 4096, 128),  # gate_up_proj (11008 * 2)
         (4096, 11008, 128),  # down_proj
         # Additional test shapes
-        (8, 128, 128),
+        (8, 16, 16),
+        (4608, 2560, 128),  # pair for Qwen3-VL-4B g32 qkv shape
+        (6144, 2560, 32),  # pair for Qwen3-4B g128 qkv shape
         (6144, 2560, 128),
         (2560, 4096, 128),
         (19456, 9728, 128),
@@ -1161,9 +1168,10 @@ def main():
         regressions = []
         results = []
         for N, K, group_size in shapes:
-            if K % group_size != 0:
+            assert group_size > 0
+            if group_size % 16 != 0:
                 continue
-            if group_size != 128:
+            if K % group_size != 0:
                 continue
 
             pack_factor = 8
@@ -1376,7 +1384,10 @@ def main():
         all_pass = True
         all_expected = True
         for N, K, group_size in shapes:
-            if group_size != 128 or K % group_size != 0:
+            assert group_size > 0
+            if group_size % 16 != 0:
+                continue
+            if K % group_size != 0:
                 continue
 
             pack_factor = 8
@@ -2093,13 +2104,17 @@ Based on benchmarking, consider these changes for Strix Halo:
                 " be valid."
             )
 
-    # To streamline correctness tests, cover only the smallest shape defined for each K.
+    # To streamline correctness tests, cover only the smallest shape defined
+    # for each unique (K, group_size) pair.
     correctness_test_shapes = sorted(SHAPES, key=lambda shape: shape[0] * shape[1])
-    seen_k = set()
+    seen_kg = set()
     correctness_test_shapes = [
         shape
         for shape in correctness_test_shapes
-        if (shape[1] not in seen_k and not seen_k.add(shape[1]))
+        if (
+            (shape[1], shape[2]) not in seen_kg
+            and not seen_kg.add((shape[1], shape[2]))
+        )
     ]
 
     # Run tests
@@ -2126,11 +2141,11 @@ Based on benchmarking, consider these changes for Strix Halo:
         if args.framework == "new":
             passed = run_new_hip_kernel_correctness_test(correctness_test_shapes)
             if passed:
-                run_new_hip_kernel_benchmark(correctness_test_shapes)
+                run_new_hip_kernel_benchmark(SHAPES)
             else:
                 print("\nSkipping benchmark due to correctness failures")
         else:
-            passed = run_correctness_test(SHAPES)
+            passed = run_correctness_test(correctness_test_shapes)
             if passed:
                 run_benchmark(
                     SHAPES, include_autoawq=args.autoawq, autoawq_module=autoawq_module
