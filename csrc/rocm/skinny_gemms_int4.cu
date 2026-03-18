@@ -934,23 +934,27 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
   else                                      \
     WVSPLITK_INT4G(_YTILE, _UNRL, _N, 128)
 
-#define WVSPLIT_INT4G_TILE(_sYT, __N)   \
-  {                                     \
-    if (K_in * N_in > max_lds_len) {    \
-      if (_sYT < 30)                    \
-        WVSPLIT_INT4G_GS(4, 2, __N)     \
-      else                              \
-        WVSPLIT_INT4G_GS(4, 1, __N)     \
-    } else if (__N >= 4 && _sYT >= 480) \
-      WVSPLIT_INT4G_GS(4, 1, __N)       \
-    else if (__N >= 3 && _sYT >= 40)    \
-      WVSPLIT_INT4G_GS(4, 1, __N)       \
-    else if (__N >= 2)                  \
-      WVSPLIT_INT4G_GS(2, 2, __N)       \
-    else if (_sYT >= 30)                \
-      WVSPLIT_INT4G_GS(2, 4, __N)       \
-    else                                \
-      WVSPLIT_INT4G_GS(1, 4, __N)       \
+#define WVSPLIT_INT4G_TILE(_sYT, __N)                                 \
+  {                                                                   \
+    if (K_in * N_in > max_lds_len) {                                  \
+      if (_sYT < 30)                                                  \
+        WVSPLIT_INT4G_GS(4, 2, __N)                                   \
+      else                                                            \
+        WVSPLIT_INT4G_GS(4, 1, __N)                                   \
+    } else if (__N >= 4 && _sYT >= 480)                               \
+      WVSPLIT_INT4G_GS(4, 1, __N)                                     \
+    else if (__N >= 3 && _sYT >= 40)                                  \
+      WVSPLIT_INT4G_GS(4, 1, __N)                                     \
+    else if (__N >= 3 && _sYT < 40 && (K_in <= 2048 || K_in >= 4096)) \
+      WVSPLIT_INT4G_GS(2, 4, __N)                                     \
+    else if (__N >= 3 && _sYT < 40)                                   \
+      WVSPLIT_INT4G_GS(2, 2, __N)                                     \
+    else if (__N >= 2)                                                \
+      WVSPLIT_INT4G_GS(2, 2, __N)                                     \
+    else if (_sYT >= 30)                                              \
+      WVSPLIT_INT4G_GS(2, 4, __N)                                     \
+    else                                                              \
+      WVSPLIT_INT4G_GS(1, 4, __N)                                     \
   }
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(
