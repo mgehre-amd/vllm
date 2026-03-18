@@ -305,14 +305,15 @@ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
   #define DOT2C_FP16_INSN "v_dot2c_f32_f16"
 #endif
 
-#define DOT2C(V0, V2, V3)                                                   \
-  if constexpr (std::is_same_v<scalar_t, half>) {                           \
-    V0 = __builtin_amdgcn_fdot2(*((half2*)(&(V2))), *((half2*)(&(V3))), V0, \
-                                false);                                     \
-  } else if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {          \
-    float2 s = __bfloat1622float2(*((__hip_bfloat162*)(&(V2)))) *           \
-               __bfloat1622float2(*((__hip_bfloat162*)(&(V3))));            \
-    V0 += (s.x + s.y);                                                      \
+#define DOT2C(V0, V2, V3)                                          \
+  if constexpr (std::is_same_v<scalar_t, half>) {                  \
+    float2 s = __half22float2(*((half2*)(&(V2)))) *                \
+               __half22float2(*((half2*)(&(V3))));                 \
+    V0 += (s.x + s.y);                                             \
+  } else if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) { \
+    float2 s = __bfloat1622float2(*((__hip_bfloat162*)(&(V2)))) *  \
+               __bfloat1622float2(*((__hip_bfloat162*)(&(V3))));   \
+    V0 += (s.x + s.y);                                             \
   }
 
 // GFX11 (RDNA, wave32) butterfly reduction: sum all 32 lanes within one
