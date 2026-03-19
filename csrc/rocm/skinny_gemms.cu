@@ -1282,19 +1282,36 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
   else                                     \
     WVSPLITK_LAUNCH(64, _YTILE, _UNRL, _N)
 
-#define WVSPLIT_TILE(_sYT, __N)                           \
-  {                                                       \
-    bool fit_lds = (Kbp_in * N_in <= max_lds_len);        \
-    if (_sYT <= 1)                                        \
-      WVSPLITK(1, 4, __N)                                 \
-    else if ((__N == 1) || (!fit_lds) || (_sYT <= 4 * 2)) \
-      WVSPLITK(2, 2, __N)                                 \
-    else if (_sYT <= 4 * 3)                               \
-      WVSPLITK(3, 2, __N)                                 \
-    else if (__N == 4)                                    \
-      WVSPLITK(4, 1, __N)                                 \
-    else                                                  \
-      WVSPLITK(4, 2, __N)                                 \
+#define WVSPLIT_TILE(_sYT, __N)                                      \
+  {                                                                  \
+    bool fit_lds = (Kbp_in * N_in <= max_lds_len);                   \
+    if (is_gfx11()) {                                                \
+      if (_sYT <= 1)                                                 \
+        WVSPLITK(1, 4, __N)                                          \
+      else if (K_in < 1024)                                          \
+        WVSPLITK(2, 4, __N)                                          \
+      else if ((K_in % 1024 == 512) && (_sYT >= 40 || K_in >= 4096)) \
+        WVSPLITK(4, 1, __N)                                          \
+      else if (K_in <= 2048 && (__N >= 2 || _sYT <= 26))             \
+        WVSPLITK(1, 4, __N)                                          \
+      else if (__N >= 2 && !fit_lds)                                 \
+        WVSPLITK(1, 4, __N)                                          \
+      else if (__N == 1)                                             \
+        WVSPLITK(1, 2, __N)                                          \
+      else                                                           \
+        WVSPLITK(1, 1, __N)                                          \
+    } else {                                                         \
+      if (_sYT <= 1)                                                 \
+        WVSPLITK(1, 4, __N)                                          \
+      else if ((__N == 1) || (!fit_lds) || (_sYT <= 4 * 2))          \
+        WVSPLITK(2, 2, __N)                                          \
+      else if (_sYT <= 4 * 3)                                        \
+        WVSPLITK(3, 2, __N)                                          \
+      else if (__N == 4)                                             \
+        WVSPLITK(4, 1, __N)                                          \
+      else                                                           \
+        WVSPLITK(4, 2, __N)                                          \
+    }                                                                \
   }
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(in_b.scalar_type(), "wvSplitK", [&] {
@@ -1332,6 +1349,128 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
   });
   return out_c;
 }
+
+// Sweep function disabled by default to reduce compile time.
+// Build with -DVLLM_SKINNY_GEMM_SWEEP to enable.
+#ifdef VLLM_SKINNY_GEMM_SWEEP
+torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,
+                             const std::optional<at::Tensor>& in_bias,
+                             const int64_t CuCount, const int64_t ytile,
+                             const int64_t unrl) {
+  auto M_in = in_a.size(0);
+  auto K_in = in_a.size(1);
+  auto N_in = in_b.size(0);
+  auto Kap_in = in_a.stride(0);
+  auto Kbp_in = in_b.stride(0);
+  auto Bx_in =
+      (in_bias.has_value() && in_bias->numel() > 0)
+          ? (in_bias->sizes().size() == 2) ? in_bias->size(1) : in_bias->size(0)
+          : 1;
+  auto By_in = (in_bias.has_value() && in_bias->numel() > 0 &&
+                in_bias->sizes().size() == 2)
+                   ? in_bias->size(0)
+                   : 1;
+
+  TORCH_CHECK(in_a.dtype() == in_b.dtype());
+  TORCH_CHECK(K_in % 8 == 0, "k % 8 == 0");
+  TORCH_CHECK(in_a.dtype() == torch::kFloat16 ||
+              in_a.dtype() == torch::kBFloat16);
+  TORCH_CHECK(M_in % ytile == 0, "M must be divisible by ytile=", ytile);
+
+  auto out_c = torch::empty(
+      {N_in, M_in},
+      torch::TensorOptions().dtype(in_b.dtype()).device(in_b.device()));
+
+  dim3 grid(CuCount);
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int max_lds_len = get_lds_size() / 2;
+
+  #define WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, _N)                  \
+    {                                                                       \
+      dim3 block(_THRDS, 16);                                               \
+      int __wvPrGrp = mindiv(M_in, CuCount * _YTILE, 16);                   \
+      if ((Kbp_in * N_in <= max_lds_len) && (M_in % _YTILE == 0))           \
+        wvSplitK_hf_sml_<fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>          \
+            <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in, \
+                                         By_in, af4, bf4, biasf4, c,        \
+                                         __wvPrGrp, CuCount);               \
+      else if (Kbp_in * N_in <= max_lds_len * 1.2)                          \
+        wvSplitK_hf_<fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>              \
+            <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in, \
+                                         By_in, af4, bf4, biasf4, c,        \
+                                         __wvPrGrp, CuCount);               \
+      else                                                                  \
+        wvSplitK_hf_big_<fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>          \
+            <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in, \
+                                         By_in, af4, bf4, biasf4, c,        \
+                                         __wvPrGrp, CuCount);               \
+    }
+
+  #define WVSPLITK_SWEEP_N(_THRDS, _YTILE, _UNRL)              \
+    switch (N_in) {                                            \
+      case 1:                                                  \
+        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 1) break; \
+      case 2:                                                  \
+        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 2) break; \
+      case 3:                                                  \
+        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 3) break; \
+      case 4:                                                  \
+        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 4) break; \
+      default:                                                 \
+        TORCH_CHECK(false, "Unsupported N=", N_in);            \
+    }
+
+  #define WVSPLITK_SWEEP_UNRL(_THRDS, _YTILE)        \
+    if (unrl == 1) {                                 \
+      WVSPLITK_SWEEP_N(_THRDS, _YTILE, 1)            \
+    } else if (unrl == 2) {                          \
+      WVSPLITK_SWEEP_N(_THRDS, _YTILE, 2)            \
+    } else if (unrl == 4) {                          \
+      WVSPLITK_SWEEP_N(_THRDS, _YTILE, 4)            \
+    } else {                                         \
+      TORCH_CHECK(false, "Unsupported unrl=", unrl); \
+    }
+
+  #define WVSPLITK_SWEEP_YTILE(_THRDS)                 \
+    if (ytile == 1) {                                  \
+      WVSPLITK_SWEEP_UNRL(_THRDS, 1)                   \
+    } else if (ytile == 2) {                           \
+      WVSPLITK_SWEEP_UNRL(_THRDS, 2)                   \
+    } else if (ytile == 3) {                           \
+      WVSPLITK_SWEEP_UNRL(_THRDS, 3)                   \
+    } else if (ytile == 4) {                           \
+      WVSPLITK_SWEEP_UNRL(_THRDS, 4)                   \
+    } else {                                           \
+      TORCH_CHECK(false, "Unsupported ytile=", ytile); \
+    }
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(in_b.scalar_type(), "wvSplitK_sweep", [&] {
+    using fptype = typename scalar<scalar_t>::type;
+    fptype* af4 = reinterpret_cast<fptype*>(in_a.data_ptr());
+    const fptype* bf4 = reinterpret_cast<const fptype*>(in_b.data_ptr());
+    const fptype* biasf4 =
+        (in_bias.has_value() && in_bias->numel() > 0)
+            ? reinterpret_cast<const fptype*>(in_bias->data_ptr())
+            : nullptr;
+    fptype* c = reinterpret_cast<fptype*>(out_c.data_ptr());
+
+    if (is_gfx11()) {
+      WVSPLITK_SWEEP_YTILE(32)
+    } else {
+      WVSPLITK_SWEEP_YTILE(64)
+    }
+  });
+
+  #undef WVSPLITK_SWEEP_LAUNCH
+  #undef WVSPLITK_SWEEP_N
+  #undef WVSPLITK_SWEEP_UNRL
+  #undef WVSPLITK_SWEEP_YTILE
+
+  return out_c;
+}
+#endif  // VLLM_SKINNY_GEMM_SWEEP
 
 // This version targets cases skinny where CUs are not filled
 // Wave-SplitK is used with reduction done via atomics.

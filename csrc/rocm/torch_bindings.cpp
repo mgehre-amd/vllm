@@ -26,6 +26,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor");
   rocm_ops.impl("wvSplitK", torch::kCUDA, &wvSplitK);
 
+#ifdef VLLM_SKINNY_GEMM_SWEEP
+  // FP16/BF16 skinny GEMM sweep: ytile/unrl as runtime args (benchmark only)
+  rocm_ops.def(
+      "wvSplitK_sweep(Tensor in_a, Tensor in_b, Tensor? in_bias, "
+      "int CuCount, int ytile, int unrl) -> Tensor");
+  rocm_ops.impl("wvSplitK_sweep", torch::kCUDA, &wvSplitK_sweep);
+#endif
+
   // W8A16 skinny GEMM: int8 weights, fp16/bf16 activations, per-channel scale
   rocm_ops.def(
       "wvSplitK_int8(Tensor in_a, Tensor in_b, Tensor in_scale, "

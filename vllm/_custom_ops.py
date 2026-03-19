@@ -2331,6 +2331,17 @@ def wvSplitK(
     return torch.ops._rocm_C.wvSplitK(a, b, bias, cu_count)
 
 
+def wvSplitK_sweep(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    cu_count: int,
+    ytile: int,
+    unrl: int,
+    bias: torch.Tensor = None,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.wvSplitK_sweep(a, b, bias, cu_count, ytile, unrl)
+
+
 def wvSplitK_int8(
     a: torch.Tensor,
     b: torch.Tensor,
