@@ -258,8 +258,10 @@ if __name__ == "__main__":
         print()
 
     print("=" * 60)
-    print(f"Results: {exact_matches}/{len(TEST_CASES)} exact matches "
-          f"({exact_matches/len(TEST_CASES):.0%})")
+    print(
+        f"Results: {exact_matches}/{len(TEST_CASES)} exact matches "
+        f"({exact_matches / len(TEST_CASES):.0%})"
+    )
 
     if exact_matches >= 4:
         print("PASS: Achieved target 80% accuracy (4/5 matches)")

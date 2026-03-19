@@ -352,12 +352,9 @@ async def async_request_openai_chat_completions(
             if response.status == 200:
                 if not use_streaming:
                     body = await response.json()
-                    output.generated_text = (
-                        (body.get("choices") or [{}])[0]
-                        .get("message", {})
-                        .get("content", "")
-                        or ""
-                    )
+                    output.generated_text = (body.get("choices") or [{}])[0].get(
+                        "message", {}
+                    ).get("content", "") or ""
                     if usage := body.get("usage"):
                         output.output_tokens = usage.get("completion_tokens") or 0
                     output.success = True
@@ -393,14 +390,13 @@ async def async_request_openai_chat_completions(
                                     # Decoding phase
                                     else:
                                         output.itl.append(
-                                            timestamp
-                                            - most_recent_timestamp
+                                            timestamp - most_recent_timestamp
                                         )
 
                                     generated_text += content or ""
                                 elif usage := data.get("usage"):
-                                    output.output_tokens = (
-                                        usage.get("completion_tokens")
+                                    output.output_tokens = usage.get(
+                                        "completion_tokens"
                                     )
 
                                 most_recent_timestamp = timestamp
@@ -424,9 +420,7 @@ async def async_request_openai_chat_completions(
                             if output.output_tokens and output.output_tokens > 0:
                                 inferred = lat / output.output_tokens
                                 output.ttft = inferred
-                                output.itl = [
-                                    inferred
-                                ] * (output.output_tokens - 1)
+                                output.itl = [inferred] * (output.output_tokens - 1)
                             most_recent_timestamp = time.perf_counter()
                         except (json.JSONDecodeError, KeyError):
                             pass
