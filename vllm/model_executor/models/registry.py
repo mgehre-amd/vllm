@@ -462,6 +462,7 @@ _MULTIMODAL_MODELS = {
     "Ovis2_5": ("ovis2_5", "Ovis2_5"),
     "Ovis2_6ForCausalLM": ("ovis2_5", "Ovis2_5"),
     "Ovis2_6_MoeForCausalLM": ("ovis2_5", "Ovis2_5"),
+    "OpenVLAForActionPrediction": ("openvla", "OpenVLAForActionPrediction"),
     "PaddleOCRVLForConditionalGeneration": (
         "paddleocr_vl",
         "PaddleOCRVLForConditionalGeneration",

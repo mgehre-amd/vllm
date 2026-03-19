@@ -52,6 +52,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "NemotronHConfig": "vllm.transformers_utils.configs.nemotron_h",
     "Olmo3Config": "vllm.transformers_utils.configs.olmo3",
     "OlmoHybridConfig": "vllm.transformers_utils.configs.olmo_hybrid",
+    "OpenVLAConfig": "vllm.transformers_utils.configs.openvla",
     "OvisConfig": "vllm.transformers_utils.configs.ovis",
     "PixelShuffleSiglip2VisionConfig": "vllm.transformers_utils.configs.isaac",
     "RadioConfig": "vllm.transformers_utils.configs.radio",
