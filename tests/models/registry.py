@@ -1005,6 +1005,10 @@ _MULTIMODAL_EXAMPLE_MODELS = {
     "Ovis2_6_MoeForCausalLM": _HfExamplesInfo(
         "AIDC-AI/Ovis2.6-30B-A3B", trust_remote_code=True
     ),
+    "OpenVLAForActionPrediction": _HfExamplesInfo(
+        "openvla/openvla-7b",
+        trust_remote_code=True,
+    ),
     "PaddleOCRVLForConditionalGeneration": _HfExamplesInfo(
         "PaddlePaddle/PaddleOCR-VL",
         trust_remote_code=True,
