@@ -415,8 +415,9 @@ torch::Tensor wvSplitK_int8(const at::Tensor& in_a, const at::Tensor& in_b,
   return out_c;
 }
 
-// Sweep function: all 4 tuning params dispatched at runtime (fp16 only).
-// Used for benchmarking only — not for production.
+// Sweep function disabled by default to reduce compile time.
+// Build with -DVLLM_SKINNY_GEMM_SWEEP to enable.
+#ifdef VLLM_SKINNY_GEMM_SWEEP
 torch::Tensor wvSplitK_int8_sweep(const at::Tensor& in_a,
                                   const at::Tensor& in_b,
                                   const at::Tensor& in_scale,
@@ -459,62 +460,62 @@ torch::Tensor wvSplitK_int8_sweep(const at::Tensor& in_a,
 
   const int THRDS = is_gfx11_int8() ? 32 : 64;
 
-#define SWEEP_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, _N)          \
-  {                                                                         \
-    dim3 block(_THRDS, _WVPRGRP);                                           \
-    int __wvPrGrp = mindiv_int8(M_in, CuCount * _YTILE, _WVPRGRP);          \
-    wvSplitK_int8_hf_sml_<fptype, _THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, \
-                          _N>                                               \
-        <<<grid, block, 0, stream>>>(K_in, M_in, 1, 1, wptr, aptr, sptr,    \
-                                     biasptr, cptr, __wvPrGrp, CuCount);    \
-  }
+  #define SWEEP_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, _N)          \
+    {                                                                         \
+      dim3 block(_THRDS, _WVPRGRP);                                           \
+      int __wvPrGrp = mindiv_int8(M_in, CuCount * _YTILE, _WVPRGRP);          \
+      wvSplitK_int8_hf_sml_<fptype, _THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, \
+                            _N>                                               \
+          <<<grid, block, 0, stream>>>(K_in, M_in, 1, 1, wptr, aptr, sptr,    \
+                                       biasptr, cptr, __wvPrGrp, CuCount);    \
+    }
 
-#define SWEEP_N(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL)              \
-  switch (N_in) {                                                      \
-    case 1:                                                            \
-      SWEEP_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, 1) break; \
-    case 2:                                                            \
-      SWEEP_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, 2) break; \
-    case 3:                                                            \
-      SWEEP_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, 3) break; \
-    case 4:                                                            \
-      SWEEP_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, 4) break; \
-    default:                                                           \
-      TORCH_CHECK(false, "Unsupported N=", N_in);                      \
-  }
+  #define SWEEP_N(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL)              \
+    switch (N_in) {                                                      \
+      case 1:                                                            \
+        SWEEP_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, 1) break; \
+      case 2:                                                            \
+        SWEEP_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, 2) break; \
+      case 3:                                                            \
+        SWEEP_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, 3) break; \
+      case 4:                                                            \
+        SWEEP_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, 4) break; \
+      default:                                                           \
+        TORCH_CHECK(false, "Unsupported N=", N_in);                      \
+    }
 
-#define SWEEP_UNRL(_THRDS, _YTILE, _WVPRGRP, _ACHUNK) \
-  if (unrl == 1) {                                    \
-    SWEEP_N(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, 1)     \
-  } else if (unrl == 2) {                             \
-    SWEEP_N(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, 2)     \
-  } else if (unrl == 4) {                             \
-    SWEEP_N(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, 4)     \
-  } else {                                            \
-    TORCH_CHECK(false, "Unsupported unrl=", unrl);    \
-  }
+  #define SWEEP_UNRL(_THRDS, _YTILE, _WVPRGRP, _ACHUNK) \
+    if (unrl == 1) {                                    \
+      SWEEP_N(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, 1)     \
+    } else if (unrl == 2) {                             \
+      SWEEP_N(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, 2)     \
+    } else if (unrl == 4) {                             \
+      SWEEP_N(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, 4)     \
+    } else {                                            \
+      TORCH_CHECK(false, "Unsupported unrl=", unrl);    \
+    }
 
-#define SWEEP_YTILE(_THRDS, _WVPRGRP, _ACHUNK)       \
-  if (ytile == 1) {                                  \
-    SWEEP_UNRL(_THRDS, 1, _WVPRGRP, _ACHUNK)         \
-  } else if (ytile == 2) {                           \
-    SWEEP_UNRL(_THRDS, 2, _WVPRGRP, _ACHUNK)         \
-  } else if (ytile == 4) {                           \
-    SWEEP_UNRL(_THRDS, 4, _WVPRGRP, _ACHUNK)         \
-  } else {                                           \
-    TORCH_CHECK(false, "Unsupported ytile=", ytile); \
-  }
+  #define SWEEP_YTILE(_THRDS, _WVPRGRP, _ACHUNK)       \
+    if (ytile == 1) {                                  \
+      SWEEP_UNRL(_THRDS, 1, _WVPRGRP, _ACHUNK)         \
+    } else if (ytile == 2) {                           \
+      SWEEP_UNRL(_THRDS, 2, _WVPRGRP, _ACHUNK)         \
+    } else if (ytile == 4) {                           \
+      SWEEP_UNRL(_THRDS, 4, _WVPRGRP, _ACHUNK)         \
+    } else {                                           \
+      TORCH_CHECK(false, "Unsupported ytile=", ytile); \
+    }
 
-#define SWEEP_WVPRGRP(_THRDS, _ACHUNK)                   \
-  if (wvprgrp == 8) {                                    \
-    SWEEP_YTILE(_THRDS, 8, _ACHUNK)                      \
-  } else if (wvprgrp == 12) {                            \
-    SWEEP_YTILE(_THRDS, 12, _ACHUNK)                     \
-  } else if (wvprgrp == 16) {                            \
-    SWEEP_YTILE(_THRDS, 16, _ACHUNK)                     \
-  } else {                                               \
-    TORCH_CHECK(false, "Unsupported wvprgrp=", wvprgrp); \
-  }
+  #define SWEEP_WVPRGRP(_THRDS, _ACHUNK)                   \
+    if (wvprgrp == 8) {                                    \
+      SWEEP_YTILE(_THRDS, 8, _ACHUNK)                      \
+    } else if (wvprgrp == 12) {                            \
+      SWEEP_YTILE(_THRDS, 12, _ACHUNK)                     \
+    } else if (wvprgrp == 16) {                            \
+      SWEEP_YTILE(_THRDS, 16, _ACHUNK)                     \
+    } else {                                               \
+      TORCH_CHECK(false, "Unsupported wvprgrp=", wvprgrp); \
+    }
 
   if (THRDS == 32) {
     if (achunk == 8) {
@@ -538,11 +539,12 @@ torch::Tensor wvSplitK_int8_sweep(const at::Tensor& in_a,
     }
   }
 
-#undef SWEEP_LAUNCH
-#undef SWEEP_N
-#undef SWEEP_UNRL
-#undef SWEEP_YTILE
-#undef SWEEP_WVPRGRP
+  #undef SWEEP_LAUNCH
+  #undef SWEEP_N
+  #undef SWEEP_UNRL
+  #undef SWEEP_YTILE
+  #undef SWEEP_WVPRGRP
 
   return out_c;
 }
+#endif  // VLLM_SKINNY_GEMM_SWEEP

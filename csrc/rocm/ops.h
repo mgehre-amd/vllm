@@ -14,6 +14,22 @@ torch::Tensor wvSplitK_int8(const at::Tensor& in_a, const at::Tensor& in_b,
                             const std::optional<at::Tensor>& in_bias,
                             const int64_t CuCount);
 
+torch::Tensor wvSplitK_int4(const at::Tensor& in_a, const at::Tensor& in_b,
+                            const at::Tensor& in_scale,
+                            const std::optional<at::Tensor>& in_bias,
+                            const int64_t CuCount);
+
+torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
+                              const at::Tensor& in_scale,
+                              const std::optional<at::Tensor>& in_bias,
+                              const int64_t CuCount, const int64_t group_size);
+
+#ifdef VLLM_SKINNY_GEMM_SWEEP
+torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,
+                             const std::optional<at::Tensor>& in_bias,
+                             const int64_t CuCount, const int64_t ytile,
+                             const int64_t unrl);
+
 torch::Tensor wvSplitK_int8_sweep(const at::Tensor& in_a,
                                   const at::Tensor& in_b,
                                   const at::Tensor& in_scale,
@@ -22,11 +38,6 @@ torch::Tensor wvSplitK_int8_sweep(const at::Tensor& in_a,
                                   const int64_t unrl, const int64_t achunk,
                                   const int64_t wvprgrp);
 
-torch::Tensor wvSplitK_int4(const at::Tensor& in_a, const at::Tensor& in_b,
-                            const at::Tensor& in_scale,
-                            const std::optional<at::Tensor>& in_bias,
-                            const int64_t CuCount);
-
 torch::Tensor wvSplitK_int4_sweep(const at::Tensor& in_a,
                                   const at::Tensor& in_b,
                                   const at::Tensor& in_scale,
@@ -34,11 +45,6 @@ torch::Tensor wvSplitK_int4_sweep(const at::Tensor& in_a,
                                   const int64_t CuCount, const int64_t ytile,
                                   const int64_t unrl, const int64_t achunk,
                                   const int64_t wvprgrp);
-
-torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
-                              const at::Tensor& in_scale,
-                              const std::optional<at::Tensor>& in_bias,
-                              const int64_t CuCount, const int64_t group_size);
 
 torch::Tensor wvSplitK_int4g_sweep(
     const at::Tensor& in_a, const at::Tensor& in_b, const at::Tensor& in_scale,
@@ -49,12 +55,6 @@ torch::Tensor wvSplitK_int4g_hf_sweep(
     const at::Tensor& in_a, const at::Tensor& in_b, const at::Tensor& in_scale,
     const int64_t CuCount, const int64_t group_size, const int64_t ytile,
     const int64_t unrl, const int64_t achunk, const int64_t wvprgrp);
-
-#ifdef VLLM_SKINNY_GEMM_SWEEP
-torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,
-                             const std::optional<at::Tensor>& in_bias,
-                             const int64_t CuCount, const int64_t ytile,
-                             const int64_t unrl);
 #endif
 
 torch::Tensor wvSplitKrc(const at::Tensor& in_a, const at::Tensor& in_b,
