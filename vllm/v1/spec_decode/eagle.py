@@ -430,7 +430,11 @@ class SpecDecodeBaseProposer:
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
-        uniform_decode = target_model_batch_desc.uniform
+        uniform_decode = (
+            target_model_batch_desc.uniform
+            if target_model_batch_desc is not None
+            else False
+        )
         cudagraph_runtime_mode, batch_desc, num_input_tokens, num_tokens_across_dp = (
             self._determine_batch_execution_and_padding(num_tokens, uniform_decode)
         )
@@ -1262,9 +1266,6 @@ class SpecDecodeBaseProposer:
             and not self.vllm_config.parallel_config.use_ubatching
             and not self.speculative_config.disable_padded_drafter_batch
         ):
-            # Currently Ubatch does not support FULL in speculative decoding, unpadded
-            # drafter batch either due to the dynamic number of tokens.
-            # We can consider supporting FULL for these cases in the future if needed.
             self.model = CUDAGraphWrapper(
                 self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
             )

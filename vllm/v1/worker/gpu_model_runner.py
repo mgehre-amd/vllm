@@ -3760,92 +3760,115 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
-        with (
-            set_forward_context(
+
+        # Check if we have a merged FULL graph for this batch.
+        has_merged_graph = (
+            hasattr(self, "_merged_full_graphs")
+            and batch_desc is not None
+            and batch_desc in self._merged_full_graphs
+        )
+        use_merged_graph = has_merged_graph and getattr(self, "_merged_hs_ready", False)
+        if has_merged_graph and not use_merged_graph:
+            cudagraph_mode = CUDAGraphMode.NONE
+
+        if use_merged_graph:
+            with set_forward_context(
                 attn_metadata,
                 self.vllm_config,
                 num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_mode,
+                cudagraph_runtime_mode=CUDAGraphMode.FULL,
                 batch_descriptor=batch_desc,
-                ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
-            ),
-            record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                defer_finalize=defer_kv_connector_finalize,
-            ) as kv_connector_output,
-        ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            ):
+                self._merged_full_graphs[batch_desc].replay()
+            hidden_states = self._merged_full_hidden_states
+            aux_hidden_states = None
+            logits = self._merged_full_logits
+            sample_hidden_states = hidden_states[logits_indices]
+            kv_connector_output = None
+            self._merged_replay_active = True
+        else:
+            self._merged_replay_active = False
+            with (
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,
+                    skip_compiled=has_encoder_input,
+                ),
+                record_function_or_nullcontext("gpu_model_runner: forward"),
+                self.maybe_get_kv_connector_output(
+                    scheduler_output,
+                    defer_finalize=defer_kv_connector_finalize,
+                ) as kv_connector_output,
+            ):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
-        with record_function_or_nullcontext("gpu_model_runner: postprocess"):
-            if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
-                hidden_states, aux_hidden_states = model_output
-            else:
-                # Common case.
-                hidden_states = model_output
-                aux_hidden_states = None
-
-            if not self.broadcast_pp_output:
-                # Common case.
-                if not get_pp_group().is_last_rank:
-                    # Return the intermediate tensors.
-                    assert isinstance(hidden_states, IntermediateTensors)
-                    hidden_states.kv_connector_output = kv_connector_output
-                    self.kv_connector_output = kv_connector_output
-                    return hidden_states
-
-                if self.is_pooling_model:
-                    # Return the pooling output.
-                    return self._pool(
-                        hidden_states,
-                        num_scheduled_tokens,
-                        num_scheduled_tokens_np,
-                        kv_connector_output,
-                    )
-
-                sample_hidden_states = hidden_states[logits_indices]
-                with self._prefer_hipblaslt_for_logits():
-                    logits = self.model.compute_logits(sample_hidden_states)
-            else:
-                # Rare case.
-                assert not self.is_pooling_model
-
-                sample_hidden_states = hidden_states[logits_indices]
-                if not get_pp_group().is_last_rank:
-                    all_gather_tensors = {
-                        "residual": not is_residual_scattered_for_sp(
-                            self.vllm_config, num_tokens_padded
-                        )
-                    }
-                    get_pp_group().send_tensor_dict(
-                        hidden_states.tensors,
-                        all_gather_group=get_tp_group(),
-                        all_gather_tensors=all_gather_tensors,
-                    )
-                    logits = None
+            with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+                if self.use_aux_hidden_state_outputs:
+                    hidden_states, aux_hidden_states = model_output
                 else:
+                    hidden_states = model_output
+                    aux_hidden_states = None
+
+                if not self.broadcast_pp_output:
+                    if not get_pp_group().is_last_rank:
+                        assert isinstance(hidden_states, IntermediateTensors)
+                        hidden_states.kv_connector_output = kv_connector_output
+                        self.kv_connector_output = kv_connector_output
+                        return hidden_states
+
+                    if self.is_pooling_model:
+                        return self._pool(
+                            hidden_states,
+                            num_scheduled_tokens,
+                            num_scheduled_tokens_np,
+                            kv_connector_output,
+                        )
+
+                    sample_hidden_states = hidden_states[logits_indices]
                     with self._prefer_hipblaslt_for_logits():
                         logits = self.model.compute_logits(sample_hidden_states)
+                else:
+                    assert not self.is_pooling_model
+                    sample_hidden_states = hidden_states[logits_indices]
+                    if not get_pp_group().is_last_rank:
+                        all_gather_tensors = {
+                            "residual": not is_residual_scattered_for_sp(
+                                self.vllm_config, num_tokens_padded
+                            )
+                        }
+                        get_pp_group().send_tensor_dict(
+                            hidden_states.tensors,
+                            all_gather_group=get_tp_group(),
+                            all_gather_tensors=all_gather_tensors,
+                        )
+                        logits = None
+                    else:
+                        with self._prefer_hipblaslt_for_logits():
+                            logits = self.model.compute_logits(sample_hidden_states)
 
-                model_output_broadcast_data: dict[str, Any] = {}
-                if logits is not None:
-                    model_output_broadcast_data["logits"] = logits.contiguous()
+                    model_output_broadcast_data: dict[str, Any] = {}
+                    if logits is not None:
+                        model_output_broadcast_data["logits"] = logits.contiguous()
 
-                broadcasted = get_pp_group().broadcast_tensor_dict(
-                    model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
-                )
-                assert broadcasted is not None
-                logits = broadcasted["logits"]
+                    broadcasted = get_pp_group().broadcast_tensor_dict(
+                        model_output_broadcast_data,
+                        src=len(get_pp_group().ranks) - 1,
+                    )
+                    assert broadcasted is not None
+                    logits = broadcasted["logits"]
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -3859,6 +3882,7 @@ class GPUModelRunner(
             cudagraph_stats,
             slot_mappings,
         )
+        self._last_batch_desc = batch_desc
         self.kv_connector_output = kv_connector_output
         return None
 
@@ -3897,6 +3921,7 @@ class GPUModelRunner(
             cudagraph_stats,
             slot_mappings,
         ) = self.execute_model_state
+        batch_desc = getattr(self, "_last_batch_desc", None)
         # Clear ephemeral state.
         self.execute_model_state = None
 
@@ -3926,6 +3951,39 @@ class GPUModelRunner(
         self._draft_token_req_ids = None
         self.input_batch.prev_sampled_token_ids = None
 
+        merged_replay_active = getattr(self, "_merged_replay_active", False)
+        if merged_replay_active:
+            self._draft_token_ids = self._merged_draft_token_ids
+            self._copy_draft_token_ids_to_cpu(scheduler_output)
+
+            if (
+                self.valid_sampled_token_count_event is not None
+                and spec_decode_common_attn_metadata is not None
+            ):
+                sampled_tids = sampler_output.sampled_token_ids
+                next_tids, valid_counts = self.drafter.prepare_next_token_ids_padded(
+                    spec_decode_common_attn_metadata,
+                    sampled_tids,
+                    self.requests,
+                    self.input_batch,
+                    self.discard_request_mask.gpu,
+                )
+                self._copy_valid_sampled_token_count(
+                    next_tids,
+                    valid_counts,
+                )
+
+            self._merged_replay_active = False
+
+        if hasattr(self, "_merged_full_graphs"):
+            self._update_merged_drafter_inputs(
+                sampler_output,
+                hidden_states,
+                aux_hidden_states,
+                scheduler_output,
+                merged_replayed=merged_replay_active,
+            )
+
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
@@ -3939,12 +3997,13 @@ class GPUModelRunner(
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
                     slot_mappings,
+                    target_model_batch_desc=batch_desc,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
-        if spec_config is not None:
+        if spec_config is not None and not merged_replay_active:
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len
@@ -3955,8 +4014,6 @@ class GPUModelRunner(
                 or spec_config.uses_extract_hidden_states()
             ) and not spec_config.disable_padded_drafter_batch
             if use_gpu_toks:
-                # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
-                # as inputs, and does not need to wait for bookkeeping to finish.
                 assert isinstance(
                     self.drafter,
                     EagleProposer | DraftModelProposer | ExtractHiddenStatesProposer,
@@ -4227,7 +4284,10 @@ class GPUModelRunner(
         aux_hidden_states: list[torch.Tensor] | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
-        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        slot_mappings: dict[str, torch.Tensor]
+        | list[dict[str, torch.Tensor]]
+        | None = None,
+        target_model_batch_desc: "BatchDescriptor | None" = None,
     ) -> list[list[int]] | torch.Tensor:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
@@ -4441,6 +4501,7 @@ class GPUModelRunner(
                         common_attn_metadata,
                         spec_decode_metadata,
                         valid_sampled_tokens_count,
+                        self.input_batch,
                     )
                     total_num_tokens = common_attn_metadata.num_actual_tokens
                     # When padding the batch, token_indices is just a range
@@ -4470,12 +4531,50 @@ class GPUModelRunner(
                 token_indices_to_sample=token_indices_to_sample,
                 sampling_metadata=sampling_metadata,
                 common_attn_metadata=common_attn_metadata,
+                target_model_batch_desc=target_model_batch_desc,
                 mm_embed_inputs=mm_embed_inputs,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
 
         return draft_token_ids
+
+    def _update_merged_drafter_inputs(
+        self,
+        sampler_output,
+        hidden_states: torch.Tensor,
+        aux_hidden_states,
+        scheduler_output: "SchedulerOutput",
+        merged_replayed: bool = False,
+    ):
+        """Update persistent buffers so the next merged-graph drafter
+        reads correct hidden_states and next_token_ids."""
+        if not hasattr(self, "_merged_hs_buf"):
+            return
+
+        buf = self._merged_hs_buf
+
+        if not merged_replayed:
+            # Only update hs buffer from the normal (non-merged) path.
+            # When the merged graph replayed, it already updated
+            # _merged_hs_buf via the captured copy_ operation.
+            n = scheduler_output.total_num_scheduled_tokens
+            if n > buf.shape[0]:
+                return
+            if self.use_aux_hidden_state_outputs and aux_hidden_states:
+                hs = torch.cat([h[:n] for h in aux_hidden_states], dim=-1)
+            else:
+                hs = hidden_states[:n]
+            buf[:n].copy_(hs)
+
+            if n == buf.shape[0]:
+                self._merged_hs_ready = True
+
+        accepted = sampler_output.sampled_token_ids
+        if isinstance(accepted, torch.Tensor):
+            tok = accepted[:, 0].int() if accepted.ndim == 2 else accepted.int()
+            nt = self._merged_next_token_ids
+            nt[: tok.shape[0]].copy_(tok)
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         allowed_config_names = {"load_config", "model_config"}
@@ -5792,6 +5891,7 @@ class GPUModelRunner(
         if num_warmups is None:
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+
         for _ in range(num_warmups):
             self._dummy_run(
                 desc.num_tokens,
@@ -5803,6 +5903,7 @@ class GPUModelRunner(
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
             )
+
         self._dummy_run(
             desc.num_tokens,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -5813,6 +5914,177 @@ class GPUModelRunner(
             num_active_loras=desc.num_active_loras,
             is_graph_capturing=True,
             profile_seq_lens=profile_seq_lens,
+        )
+
+    @torch.inference_mode()
+    def _merged_capture(self, desc: BatchDescriptor):
+        """Capture [Drafter → Target → compute_logits] in one CUDA graph.
+
+        In the reordered flow, the drafter runs first (using the PREVIOUS
+        target forward's hidden_states), then the target forward verifies
+        the PREVIOUS step's draft tokens, then compute_logits produces
+        logits for the rejection sampler (which runs outside the graph).
+
+        Between graph replays, the rejection sampler and bookkeeping run
+        on the CPU/GPU outside the graph.
+        """
+        import vllm.compilation.cuda_graph as cg
+
+        assert isinstance(self.drafter, EagleProposer)
+        num_tokens = desc.num_tokens
+
+        # Additional warmup so attention layers see the padded shapes.
+        self._dummy_run(
+            num_tokens,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            force_attention=True,
+            uniform_decode=desc.uniform,
+            skip_eplb=True,
+            remove_lora=False,
+            num_active_loras=0,
+        )
+
+        # ── Build metadata (same layout as _dummy_run for FULL) ──
+        max_query_len = self.uniform_decode_query_len
+        num_reqs = desc.num_reqs if desc.num_reqs is not None else num_tokens
+        num_scheduled_tokens_list = [max_query_len] * num_reqs
+        if num_tokens % max_query_len != 0:
+            num_scheduled_tokens_list[-1] = num_tokens % max_query_len
+        num_scheduled_tokens_np = np.array(num_scheduled_tokens_list, dtype=np.int32)
+        num_tokens_unpadded = int(num_scheduled_tokens_np.sum())
+
+        self.seq_lens.np[:num_reqs] = max_query_len
+        self.seq_lens.np[num_reqs:] = 0
+        self.seq_lens.copy_to_gpu()
+        cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens_np)
+        self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
+        self.query_start_loc.copy_to_gpu()
+
+        slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+            num_tokens_padded=num_tokens,
+            num_reqs_padded=num_reqs,
+            num_tokens_unpadded=num_tokens_unpadded,
+            ubatch_slices=None,
+        )
+
+        target_attn_metadata, spec_decode_cm = self._build_attention_metadata(
+            num_tokens=num_tokens_unpadded,
+            num_tokens_padded=num_tokens,
+            num_reqs=num_reqs,
+            max_query_len=max_query_len,
+            ubatch_slices=None,
+            for_cudagraph_capture=True,
+            slot_mappings=slot_mappings_by_group,
+            use_spec_decode=True,
+        )
+
+        input_ids = self.input_ids.gpu[:num_tokens]
+        positions = self._get_positions(num_tokens)
+
+        # ── Persistent buffers for drafter ↔ target data bridge ──
+        hidden_size = self.model_config.get_hidden_size()
+        if self.use_aux_hidden_state_outputs:
+            get = getattr(
+                self.model,
+                "get_eagle3_aux_hidden_state_layers",
+                self.model.get_eagle3_default_aux_hidden_state_layers,
+            )
+            n_aux = len(get())
+            hs_dim = hidden_size * n_aux
+        else:
+            hs_dim = hidden_size
+
+        self._merged_hs_buf = torch.zeros(
+            num_tokens,
+            hs_dim,
+            dtype=self.model_config.dtype,
+            device=self.device,
+        )
+        self._merged_next_token_ids = torch.zeros(
+            num_reqs,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        # ── Bypass individual CUDAGraphWrappers ──
+        cg._merged_capture_bypass = True
+
+        if not hasattr(self, "_merged_graph_pool"):
+            self._merged_graph_pool = torch.cuda.graph_pool_handle()
+        graph_pool = self._merged_graph_pool
+        merged_graph = torch.cuda.CUDAGraph(keep_graph=True)
+
+        assert spec_decode_cm is not None
+
+        with torch.cuda.graph(
+            merged_graph,
+            pool=graph_pool,
+            stream=torch.cuda.current_stream(),
+        ):
+            # ═══ DRAFTER ═══
+            draft_token_ids = self.drafter.propose(
+                target_token_ids=input_ids,
+                target_positions=positions,
+                target_hidden_states=self._merged_hs_buf,
+                next_token_ids=self._merged_next_token_ids,
+                token_indices_to_sample=None,
+                common_attn_metadata=spec_decode_cm,
+                target_model_batch_desc=desc,
+                sampling_metadata=self.input_batch.sampling_metadata,
+                num_rejected_tokens_gpu=None,
+                slot_mappings=slot_mappings,
+            )
+
+            # ═══ TARGET FORWARD ═══
+            with set_forward_context(
+                target_attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                batch_descriptor=desc,
+                slot_mapping=slot_mappings,
+            ):
+                if self.use_aux_hidden_state_outputs:
+                    hidden_states, aux_hs = self.model(
+                        input_ids=input_ids,
+                        positions=positions,
+                    )
+                else:
+                    hidden_states = self.model(
+                        input_ids=input_ids,
+                        positions=positions,
+                    )
+
+            # ═══ COMPUTE LOGITS ═══
+            # For spec decode, logits are needed at ALL positions
+            # (not just the last per request), so the rejection sampler
+            # can compare target vs. draft at every token.
+            sample_hidden = hidden_states[:num_tokens]
+            logits = self.model.compute_logits(sample_hidden)
+
+            # ═══ Update persistent hs buffer for next replay ═══
+            if self.use_aux_hidden_state_outputs:
+                hs_for_drafter = torch.cat([h[:num_tokens] for h in aux_hs], dim=-1)
+            else:
+                hs_for_drafter = hidden_states[:num_tokens]
+            self._merged_hs_buf.copy_(hs_for_drafter)
+
+        cg._merged_capture_bypass = False
+        merged_graph.instantiate()
+
+        # ── Store handles for replay / dump ──
+        if not hasattr(self, "_merged_full_graphs"):
+            self._merged_full_graphs = {}
+        self._merged_full_graphs[desc] = merged_graph
+        self._merged_full_logits = logits
+        self._merged_full_hidden_states = hidden_states
+        self._merged_draft_token_ids = draft_token_ids
+
+        from vllm.compilation.cuda_graph import dump_cuda_graph
+
+        dump_cuda_graph(
+            merged_graph,
+            f"MERGED_{desc.num_tokens}t_{desc.num_reqs}r",
         )
 
     def _capture_cudagraphs(
@@ -5842,6 +6114,7 @@ class GPUModelRunner(
             )
 
         # We skip EPLB here since we don't want to record dummy metrics
+        merged_descs: list[BatchDescriptor] = []
         for batch_desc in batch_descriptors:
             # We currently only capture ubatched graphs when its a FULL
             # cudagraph, a uniform decode batch, and the number of tokens
@@ -5863,6 +6136,24 @@ class GPUModelRunner(
                 allow_microbatching=allow_microbatching,
             )
             torch.accelerator.synchronize()
+
+            use_merged = (
+                cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and self.speculative_config is not None
+                and self.speculative_config.use_eagle()
+                and not self.speculative_config.disable_padded_drafter_batch
+            )
+            if use_merged:
+                merged_descs.append(batch_desc)
+
+        # Merged graphs are captured LAST, after all individual
+        # CUDAGraphWrapper graphs for all batch sizes are finalized.
+        # This prevents later individual captures from reallocating
+        # torch.compile internal buffers that the merged graph references.
+        for desc in merged_descs:
+            self._merged_capture(desc)
+            torch.accelerator.synchronize()
+
         self.maybe_remove_all_loras(self.lora_config)
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:

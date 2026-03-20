@@ -28,6 +28,148 @@ from vllm.utils.torch_utils import current_stream, weak_ref_tensors
 
 logger = init_logger(__name__)
 
+_dump_counter = 0
+
+_merged_capture_bypass = False
+
+
+def _dump_all_full_graphs():
+    """Dump FULL hipGraph DOT files using keep_graph=True handles."""
+    import ctypes
+    import os
+
+    dump_dir = "/scratch/mgehre/tmp/cudagraph_dumps"
+    os.makedirs(dump_dir, exist_ok=True)
+    rocm_path = os.environ.get("ROCM_PATH", "/opt/rocm")
+    hip_path = rocm_path + "/lib/libamdhip64.so"
+    if not os.path.exists(hip_path):
+        logger.warning("hipGraph dump: libamdhip64.so not found")
+        return
+
+    hip = ctypes.CDLL(hip_path)
+    hipGraphDebugDotPrint = hip.hipGraphDebugDotPrint
+    hipGraphDebugDotPrint.restype = ctypes.c_int
+    hipGraphDebugDotPrint.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    hipGraphGetNodes = hip.hipGraphGetNodes
+    hipGraphGetNodes.restype = ctypes.c_int
+    hipGraphGetNodes.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    hipGraphGetEdges = hip.hipGraphGetEdges
+    hipGraphGetEdges.restype = ctypes.c_int
+    hipGraphGetEdges.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+
+    count = 0
+    for wrapper in list(CUDAGraphWrapper._all_instances):
+        if wrapper.runtime_mode != CUDAGraphMode.FULL:
+            continue
+        for bd, entry in wrapper.concrete_cudagraph_entries.items():
+            if entry.cudagraph is None:
+                continue
+            try:
+                graph_handle = entry.cudagraph.raw_cuda_graph()
+            except RuntimeError:
+                logger.warning("hipGraph dump: graph_%d - no raw handle", count)
+                count += 1
+                continue
+
+            num_nodes = ctypes.c_size_t(0)
+            hipGraphGetNodes(graph_handle, None, ctypes.byref(num_nodes))
+            num_edges = ctypes.c_size_t(0)
+            hipGraphGetEdges(
+                graph_handle,
+                None,
+                None,
+                ctypes.byref(num_edges),
+            )
+
+            fname = f"graph_FULL_{count}_{bd.num_tokens}t_{bd.num_reqs}r.dot"
+            dot_path = os.path.join(dump_dir, fname).encode()
+            ret = hipGraphDebugDotPrint(graph_handle, dot_path, 0xFFFF)
+
+            logger.warning(
+                "hipGraph dump: graph_%d desc=%s nodes=%d edges=%d dot_ret=%d -> %s",
+                count,
+                bd,
+                num_nodes.value,
+                num_edges.value,
+                ret,
+                fname,
+            )
+            count += 1
+
+
+def dump_cuda_graph(graph: "torch.cuda.CUDAGraph", label: str):
+    """Dump a single keep_graph=True CUDAGraph to DOT via HIP API."""
+    import ctypes
+    import os
+
+    dump_dir = "/scratch/mgehre/tmp/cudagraph_dumps"
+    os.makedirs(dump_dir, exist_ok=True)
+    rocm_path = os.environ.get("ROCM_PATH", "/opt/rocm")
+    hip_path = rocm_path + "/lib/libamdhip64.so"
+    if not os.path.exists(hip_path):
+        logger.warning("dump_cuda_graph: libamdhip64.so not found")
+        return
+
+    hip = ctypes.CDLL(hip_path)
+    hipGraphDebugDotPrint = hip.hipGraphDebugDotPrint
+    hipGraphDebugDotPrint.restype = ctypes.c_int
+    hipGraphDebugDotPrint.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    hipGraphGetNodes = hip.hipGraphGetNodes
+    hipGraphGetNodes.restype = ctypes.c_int
+    hipGraphGetNodes.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    hipGraphGetEdges = hip.hipGraphGetEdges
+    hipGraphGetEdges.restype = ctypes.c_int
+    hipGraphGetEdges.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+
+    try:
+        graph_handle = graph.raw_cuda_graph()
+    except RuntimeError:
+        logger.warning("dump_cuda_graph: no raw handle for %s", label)
+        return
+
+    num_nodes = ctypes.c_size_t(0)
+    hipGraphGetNodes(graph_handle, None, ctypes.byref(num_nodes))
+    num_edges = ctypes.c_size_t(0)
+    hipGraphGetEdges(graph_handle, None, None, ctypes.byref(num_edges))
+
+    fname = f"graph_{label}.dot"
+    dot_path = os.path.join(dump_dir, fname).encode()
+    ret = hipGraphDebugDotPrint(graph_handle, dot_path, 0xFFFF)
+    logger.warning(
+        "hipGraph dump: %s nodes=%d edges=%d dot_ret=%d -> %s",
+        label,
+        num_nodes.value,
+        num_edges.value,
+        ret,
+        fname,
+    )
+
 
 @dataclasses.dataclass(frozen=True)
 class CUDAGraphStat:
@@ -231,6 +373,9 @@ class CUDAGraphWrapper:
         self.concrete_cudagraph_entries.clear()
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any | None:
+        if _merged_capture_bypass:
+            return self.runnable(*args, **kwargs)
+
         if not is_forward_context_available():
             # No forward context means we are outside the normal
             # inference path (e.g. a vision encoder forward pass).
@@ -264,10 +409,6 @@ class CUDAGraphWrapper:
 
         if entry.cudagraph is None:
             if self.cudagraph_options.debug_log_enable:
-                # Since we capture cudagraph for many different shapes and
-                # capturing is fast, we don't need to log it for every
-                # shape. E.g. we only log it for the first subgraph in
-                # piecewise mode.
                 logger.debug(
                     "Capturing a cudagraph on (%s,%s)",
                     self.runtime_mode.name,
@@ -280,7 +421,8 @@ class CUDAGraphWrapper:
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
             entry.input_addresses = input_addresses
-            cudagraph = torch.cuda.CUDAGraph()
+            keep = self.runtime_mode == CUDAGraphMode.FULL
+            cudagraph = torch.cuda.CUDAGraph(keep_graph=keep)
 
             with ExitStack() as stack:
                 if self.cudagraph_options.gc_disable:
@@ -329,6 +471,8 @@ class CUDAGraphWrapper:
             # here we always use weak ref for the output
             # to save memory
             entry.output = weak_ref_tensors(output)
+            if keep:
+                cudagraph.instantiate()
             entry.cudagraph = cudagraph
 
             compilation_counter.num_cudagraph_captured += 1
