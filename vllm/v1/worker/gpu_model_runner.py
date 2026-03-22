@@ -3968,18 +3968,37 @@ class GPUModelRunner(
                 self.valid_sampled_token_count_event is not None
                 and spec_decode_common_attn_metadata is not None
             ):
-                sampled_tids = sampler_output.sampled_token_ids
-                next_tids, valid_counts = self.drafter.prepare_next_token_ids_padded(
-                    spec_decode_common_attn_metadata,
-                    sampled_tids,
-                    self.requests,
-                    self.input_batch,
-                    self.discard_request_mask.gpu,
-                )
-                self._copy_valid_sampled_token_count(
-                    next_tids,
-                    valid_counts,
-                )
+                sampling_metadata = self.input_batch.sampling_metadata
+                if sampling_metadata.all_greedy:
+                    # Fast path: reuse in-graph rejection results directly.
+                    # The in-graph greedy rejection already computed
+                    # next_token_ids and num_rejected_tokens_gpu via the
+                    # same argmax comparison the real rejection sampler uses.
+                    n = self._merged_next_token_ids.shape[0]
+                    self._merged_valid_counts[:n] = (
+                        self.num_spec_tokens
+                        + 1
+                        - self._merged_num_rejected_tokens_gpu[:n]
+                    )
+                    self._copy_valid_sampled_token_count(
+                        self._merged_next_token_ids,
+                        self._merged_valid_counts,
+                    )
+                else:
+                    sampled_tids = sampler_output.sampled_token_ids
+                    next_tids, valid_counts = (
+                        self.drafter.prepare_next_token_ids_padded(
+                            spec_decode_common_attn_metadata,
+                            sampled_tids,
+                            self.requests,
+                            self.input_batch,
+                            self.discard_request_mask.gpu,
+                        )
+                    )
+                    self._copy_valid_sampled_token_count(
+                        next_tids,
+                        valid_counts,
+                    )
 
             self._merged_replay_active = False
 
@@ -6025,6 +6044,11 @@ class GPUModelRunner(
             device=self.device,
         )
         self._merged_num_rejected_tokens_gpu = torch.zeros(
+            num_reqs,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._merged_valid_counts = torch.zeros(
             num_reqs,
             dtype=torch.int32,
             device=self.device,
