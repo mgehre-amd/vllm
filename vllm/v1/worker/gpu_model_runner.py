@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -3772,6 +3773,32 @@ class GPUModelRunner(
             cudagraph_mode = CUDAGraphMode.NONE
 
         if use_merged_graph:
+            # Compute token_indices_to_sample for the merged drafter,
+            # accounting for rejected tokens from the previous step.
+            num_reqs_m = batch_desc.num_reqs or num_tokens_padded
+            if spec_decode_metadata is not None:
+                from vllm.v1.spec_decode.utils import (
+                    eagle_prepare_inputs_padded_kernel,
+                )
+
+                cu_draft = spec_decode_metadata.cu_num_draft_tokens
+                actual_reqs = self.input_batch.num_reqs
+                if cu_draft.shape[0] < num_reqs_m:
+                    cu_draft = nn.functional.pad(
+                        cu_draft,
+                        (0, num_reqs_m - actual_reqs),
+                        mode="constant",
+                        value=cu_draft[-1].item(),
+                    )
+                eagle_prepare_inputs_padded_kernel[(num_reqs_m,)](
+                    cu_draft,
+                    self._merged_prev_valid_counts,
+                    self.query_start_loc.gpu,
+                    self._merged_token_indices_to_sample,
+                    self._merged_num_rejected_tokens_gpu,
+                    num_reqs_m,
+                )
+
             with set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -3781,6 +3808,13 @@ class GPUModelRunner(
                 slot_mapping=slot_mappings,
             ):
                 self._merged_full_graphs[batch_desc].replay()
+
+            if not hasattr(self, "_merged_draft_ids_safe"):
+                self._merged_draft_ids_safe = torch.empty_like(
+                    self._merged_draft_token_ids
+                )
+            self._merged_draft_ids_safe.copy_(self._merged_draft_token_ids)
+
             hidden_states = self._merged_full_hidden_states
             aux_hidden_states = None
             logits = self._merged_full_logits
@@ -3953,7 +3987,7 @@ class GPUModelRunner(
 
         merged_replay_active = getattr(self, "_merged_replay_active", False)
         if merged_replay_active:
-            self._draft_token_ids = self._merged_draft_token_ids
+            self._draft_token_ids = self._merged_draft_ids_safe
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
             if (
@@ -3971,6 +4005,11 @@ class GPUModelRunner(
                 self._copy_valid_sampled_token_count(
                     next_tids,
                     valid_counts,
+                )
+                # Save for next merged replay's token_indices_to_sample
+                # computation and correct next_token_ids.
+                self._merged_prev_valid_counts[: valid_counts.shape[0]].copy_(
+                    valid_counts
                 )
 
             self._merged_replay_active = False
@@ -4461,6 +4500,11 @@ class GPUModelRunner(
                 self._copy_valid_sampled_token_count(
                     next_token_ids, valid_sampled_tokens_count
                 )
+                # Save valid_counts for merged graph's tis/nrej computation.
+                if hasattr(self, "_merged_prev_valid_counts"):
+                    self._merged_prev_valid_counts[
+                        : valid_sampled_tokens_count.shape[0]
+                    ].copy_(valid_sampled_tokens_count)
 
             num_rejected_tokens_gpu = None
             if spec_decode_metadata is None:
@@ -4547,34 +4591,18 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         merged_replayed: bool = False,
     ):
-        """Update persistent buffers so the next merged-graph drafter
-        reads correct hidden_states and next_token_ids."""
+        """No-op in the new Target→Logits→Drafter ordering.
+
+        The graph already computes next_token_ids via argmax(logits) and
+        feeds current-step hidden states to the drafter. This method is
+        kept for compatibility but only sets _merged_hs_ready."""
         if not hasattr(self, "_merged_hs_buf"):
             return
 
-        buf = self._merged_hs_buf
-
         if not merged_replayed:
-            # Only update hs buffer from the normal (non-merged) path.
-            # When the merged graph replayed, it already updated
-            # _merged_hs_buf via the captured copy_ operation.
             n = scheduler_output.total_num_scheduled_tokens
-            if n > buf.shape[0]:
-                return
-            if self.use_aux_hidden_state_outputs and aux_hidden_states:
-                hs = torch.cat([h[:n] for h in aux_hidden_states], dim=-1)
-            else:
-                hs = hidden_states[:n]
-            buf[:n].copy_(hs)
-
-            if n == buf.shape[0]:
+            if n == self._merged_hs_buf.shape[0]:
                 self._merged_hs_ready = True
-
-        accepted = sampler_output.sampled_token_ids
-        if isinstance(accepted, torch.Tensor):
-            tok = accepted[:, 0].int() if accepted.ndim == 2 else accepted.int()
-            nt = self._merged_next_token_ids
-            nt[: tok.shape[0]].copy_(tok)
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         allowed_config_names = {"load_config", "model_config"}
@@ -5918,12 +5946,14 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def _merged_capture(self, desc: BatchDescriptor):
-        """Capture [Drafter → Target → compute_logits] in one CUDA graph.
+        """Capture [Target → compute_logits → Drafter] in one CUDA graph.
 
-        In the reordered flow, the drafter runs first (using the PREVIOUS
-        target forward's hidden_states), then the target forward verifies
-        the PREVIOUS step's draft tokens, then compute_logits produces
-        logits for the rejection sampler (which runs outside the graph).
+        The target forward runs first with the CURRENT step's inputs,
+        then compute_logits produces logits. next_token_ids is derived
+        from argmax(logits) inside the graph so the drafter gets the
+        correct accepted token. The drafter then predicts draft tokens
+        using the CURRENT step's hidden states and the freshly computed
+        next_token_ids.
 
         Between graph replays, the rejection sampler and bookkeeping run
         on the CPU/GPU outside the graph.
@@ -5933,7 +5963,6 @@ class GPUModelRunner(
         assert isinstance(self.drafter, EagleProposer)
         num_tokens = desc.num_tokens
 
-        # Additional warmup so attention layers see the padded shapes.
         self._dummy_run(
             num_tokens,
             cudagraph_runtime_mode=CUDAGraphMode.NONE,
@@ -5981,7 +6010,7 @@ class GPUModelRunner(
         input_ids = self.input_ids.gpu[:num_tokens]
         positions = self._get_positions(num_tokens)
 
-        # ── Persistent buffers for drafter ↔ target data bridge ──
+        # ── Persistent buffers ──
         hidden_size = self.model_config.get_hidden_size()
         if self.use_aux_hidden_state_outputs:
             get = getattr(
@@ -6006,12 +6035,46 @@ class GPUModelRunner(
             device=self.device,
         )
 
+        # Buffers to save/restore shared state that the drafter modifies
+        # in-place (seq_lens, query_start_loc) after the target is done.
+        self._merged_save_seq_lens = torch.empty(
+            num_reqs, dtype=self.seq_lens.gpu.dtype, device=self.device
+        )
+        self._merged_save_qsl = torch.empty(
+            num_reqs + 1,
+            dtype=self.query_start_loc.gpu.dtype,
+            device=self.device,
+        )
+
+        blk_table = self.input_batch.block_table[0]
+        self._merged_slot_mapping_ref = blk_table.slot_mapping.gpu[:num_tokens]
+        self._merged_save_slot_mapping = torch.empty(
+            num_tokens,
+            dtype=self._merged_slot_mapping_ref.dtype,
+            device=self.device,
+        )
+
+        self._merged_token_indices_to_sample = torch.full(
+            (num_reqs,),
+            num_tokens - 1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._merged_num_rejected_tokens_gpu = torch.zeros(
+            num_reqs,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._merged_prev_valid_counts = torch.ones(
+            num_reqs,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
         # ── Bypass individual CUDAGraphWrappers ──
         cg._merged_capture_bypass = True
 
-        if not hasattr(self, "_merged_graph_pool"):
-            self._merged_graph_pool = torch.cuda.graph_pool_handle()
-        graph_pool = self._merged_graph_pool
+        graph_pool = current_platform.get_global_graph_pool()
         merged_graph = torch.cuda.CUDAGraph(keep_graph=True)
 
         assert spec_decode_cm is not None
@@ -6021,20 +6084,6 @@ class GPUModelRunner(
             pool=graph_pool,
             stream=torch.cuda.current_stream(),
         ):
-            # ═══ DRAFTER ═══
-            draft_token_ids = self.drafter.propose(
-                target_token_ids=input_ids,
-                target_positions=positions,
-                target_hidden_states=self._merged_hs_buf,
-                next_token_ids=self._merged_next_token_ids,
-                token_indices_to_sample=None,
-                common_attn_metadata=spec_decode_cm,
-                target_model_batch_desc=desc,
-                sampling_metadata=self.input_batch.sampling_metadata,
-                num_rejected_tokens_gpu=None,
-                slot_mappings=slot_mappings,
-            )
-
             # ═══ TARGET FORWARD ═══
             with set_forward_context(
                 target_attn_metadata,
@@ -6056,20 +6105,70 @@ class GPUModelRunner(
                     )
 
             # ═══ COMPUTE LOGITS ═══
-            # For spec decode, logits are needed at ALL positions
-            # (not just the last per request), so the rejection sampler
-            # can compare target vs. draft at every token.
             sample_hidden = hidden_states[:num_tokens]
-            logits = self.model.compute_logits(sample_hidden)
+            with self._prefer_hipblaslt_for_logits():
+                logits = self.model.compute_logits(sample_hidden)
 
-            # ═══ Update persistent hs buffer for next replay ═══
+            # ═══ IN-GRAPH GREEDY REJECTION + next_token_ids ═══
+            # Compute acceptance pattern by comparing argmax(logits)
+            # with draft tokens (already in input_ids from _prepare_inputs).
+            greedy_all = logits.argmax(dim=-1)  # [num_tokens]
+            greedy_per_req = greedy_all[:num_tokens].view(num_reqs, max_query_len)
+            ids_per_req = input_ids[:num_tokens].view(num_reqs, max_query_len)
+            # Draft tokens at positions 1..max_query_len-1
+            num_draft = max_query_len - 1
+            accepted = torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
+            running_match = torch.ones(num_reqs, dtype=torch.int32, device=self.device)
+            for k in range(num_draft):
+                match_k = (greedy_per_req[:, k] == ids_per_req[:, k + 1]).int()
+                running_match = running_match * match_k
+                accepted = accepted + running_match
+
+            offsets = (
+                torch.arange(num_reqs, dtype=torch.int32, device=self.device)
+                * max_query_len
+            )
+            self._merged_token_indices_to_sample[:num_reqs] = offsets + accepted
+            self._merged_num_rejected_tokens_gpu[:num_reqs] = num_draft - accepted
+            bonus = greedy_per_req.gather(1, accepted.unsqueeze(1).long()).squeeze(1)
+            self._merged_next_token_ids[:num_reqs] = bonus.int()
+
+            # ═══ PREPARE DRAFTER INPUTS ═══
+            # Save target state before drafter's in-place modifications.
+            self._merged_save_seq_lens.copy_(self.seq_lens.gpu[:num_reqs])
+            self._merged_save_qsl.copy_(self.query_start_loc.gpu[: num_reqs + 1])
+            self._merged_save_slot_mapping.copy_(self._merged_slot_mapping_ref)
+
+            # Prepare hidden states for the drafter.
             if self.use_aux_hidden_state_outputs:
                 hs_for_drafter = torch.cat([h[:num_tokens] for h in aux_hs], dim=-1)
             else:
                 hs_for_drafter = hidden_states[:num_tokens]
             self._merged_hs_buf.copy_(hs_for_drafter)
 
+            # ═══ DRAFTER ═══
+            # Uses CURRENT step's hidden states and freshly computed
+            # next_token_ids from argmax(logits).
+            draft_token_ids = self.drafter.propose(
+                target_token_ids=input_ids,
+                target_positions=positions,
+                target_hidden_states=self._merged_hs_buf,
+                next_token_ids=self._merged_next_token_ids,
+                token_indices_to_sample=self._merged_token_indices_to_sample,
+                common_attn_metadata=spec_decode_cm,
+                target_model_batch_desc=desc,
+                sampling_metadata=self.input_batch.sampling_metadata,
+                num_rejected_tokens_gpu=self._merged_num_rejected_tokens_gpu,
+                slot_mappings=slot_mappings,
+            )
+
+            # Restore target state after drafter's in-place modifications.
+            self.seq_lens.gpu[:num_reqs].copy_(self._merged_save_seq_lens)
+            self.query_start_loc.gpu[: num_reqs + 1].copy_(self._merged_save_qsl)
+            self._merged_slot_mapping_ref.copy_(self._merged_save_slot_mapping)
+
         cg._merged_capture_bypass = False
+
         merged_graph.instantiate()
 
         # ── Store handles for replay / dump ──
@@ -6150,9 +6249,14 @@ class GPUModelRunner(
         # CUDAGraphWrapper graphs for all batch sizes are finalized.
         # This prevents later individual captures from reallocating
         # torch.compile internal buffers that the merged graph references.
-        for desc in merged_descs:
-            self._merged_capture(desc)
-            torch.accelerator.synchronize()
+        if not os.environ.get("VLLM_DISABLE_MERGED_GRAPH"):
+            for desc in merged_descs:
+                self._merged_capture(desc)
+                torch.accelerator.synchronize()
+            if os.environ.get("VLLM_DISABLE_MERGED_REPLAY") and hasattr(
+                self, "_merged_full_graphs"
+            ):
+                self._merged_full_graphs.clear()
 
         self.maybe_remove_all_loras(self.lora_config)
 
