@@ -3773,32 +3773,6 @@ class GPUModelRunner(
             cudagraph_mode = CUDAGraphMode.NONE
 
         if use_merged_graph:
-            # Compute token_indices_to_sample for the merged drafter,
-            # accounting for rejected tokens from the previous step.
-            num_reqs_m = batch_desc.num_reqs or num_tokens_padded
-            if spec_decode_metadata is not None:
-                from vllm.v1.spec_decode.utils import (
-                    eagle_prepare_inputs_padded_kernel,
-                )
-
-                cu_draft = spec_decode_metadata.cu_num_draft_tokens
-                actual_reqs = self.input_batch.num_reqs
-                if cu_draft.shape[0] < num_reqs_m:
-                    cu_draft = nn.functional.pad(
-                        cu_draft,
-                        (0, num_reqs_m - actual_reqs),
-                        mode="constant",
-                        value=cu_draft[-1].item(),
-                    )
-                eagle_prepare_inputs_padded_kernel[(num_reqs_m,)](
-                    cu_draft,
-                    self._merged_prev_valid_counts,
-                    self.query_start_loc.gpu,
-                    self._merged_token_indices_to_sample,
-                    self._merged_num_rejected_tokens_gpu,
-                    num_reqs_m,
-                )
-
             with set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -4005,11 +3979,6 @@ class GPUModelRunner(
                 self._copy_valid_sampled_token_count(
                     next_tids,
                     valid_counts,
-                )
-                # Save for next merged replay's token_indices_to_sample
-                # computation and correct next_token_ids.
-                self._merged_prev_valid_counts[: valid_counts.shape[0]].copy_(
-                    valid_counts
                 )
 
             self._merged_replay_active = False
@@ -4500,11 +4469,6 @@ class GPUModelRunner(
                 self._copy_valid_sampled_token_count(
                     next_token_ids, valid_sampled_tokens_count
                 )
-                # Save valid_counts for merged graph's tis/nrej computation.
-                if hasattr(self, "_merged_prev_valid_counts"):
-                    self._merged_prev_valid_counts[
-                        : valid_sampled_tokens_count.shape[0]
-                    ].copy_(valid_sampled_tokens_count)
 
             num_rejected_tokens_gpu = None
             if spec_decode_metadata is None:
@@ -6065,12 +6029,6 @@ class GPUModelRunner(
             dtype=torch.int32,
             device=self.device,
         )
-        self._merged_prev_valid_counts = torch.ones(
-            num_reqs,
-            dtype=torch.int32,
-            device=self.device,
-        )
-
         # ── Bypass individual CUDAGraphWrappers ──
         cg._merged_capture_bypass = True
 
