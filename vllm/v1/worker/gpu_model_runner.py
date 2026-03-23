@@ -3939,8 +3939,28 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
-        with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+        merged_replay_active = getattr(self, "_merged_replay_active", False)
+        skip_external_sampler = False
+        if merged_replay_active and grammar_output is None:
+            sm = self.input_batch.sampling_metadata
+            skip_external_sampler = (
+                sm.all_greedy
+                and sm.max_num_logprobs is None
+                and sm.no_penalties
+                and not sm.bad_words_token_ids
+                and sm.allowed_token_ids_mask is None
+                and not sm.logitsprocs.non_argmax_invariant
+            )
+
+        if skip_external_sampler:
+            n = self.input_batch.num_reqs
+            sampler_output = SamplerOutput(
+                sampled_token_ids=self._build_sampled_token_ids(n),
+                logprobs_tensors=None,
+            )
+        else:
+            with record_function_or_nullcontext("gpu_model_runner: sample"):
+                sampler_output = self._sample(logits, spec_decode_metadata)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -3959,7 +3979,6 @@ class GPUModelRunner(
         self._draft_token_req_ids = None
         self.input_batch.prev_sampled_token_ids = None
 
-        merged_replay_active = getattr(self, "_merged_replay_active", False)
         if merged_replay_active:
             self._draft_token_ids = self._merged_draft_ids_safe
             self._copy_draft_token_ids_to_cpu(scheduler_output)
@@ -4269,6 +4288,33 @@ class GPUModelRunner(
         assert self.draft_token_ids_cpu is not None
         self.draft_token_ids_event.synchronize()
         return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
+
+    def _build_sampled_token_ids(self, n: int) -> torch.Tensor:
+        """Build sampled_token_ids from in-graph rejection results.
+
+        Reproduces the output format of rejection_greedy_sample_kernel:
+        positions 0..accepted-1 contain the (accepted) draft tokens,
+        position accepted contains the bonus/replacement token, and
+        remaining positions are -1 (PLACEHOLDER_TOKEN_ID).
+        """
+        mqlen = self.num_spec_tokens + 1
+        num_draft = self.num_spec_tokens
+        rejected = self._merged_num_rejected_tokens_gpu[:n]
+        accepted = num_draft - rejected
+
+        out = self._merged_sampled_token_ids[:n]
+        out.fill_(-1)
+
+        # Draft tokens live in input_ids at positions 1..num_draft per request.
+        # For greedy acceptance, draft_token == target_argmax.
+        ids = self.input_ids.gpu[: n * mqlen].view(n, mqlen)
+        valid_mask = self._merged_col_indices[:, :num_draft] < accepted.unsqueeze(1)
+        out[:, :num_draft][valid_mask] = ids[:, 1:][valid_mask].int()
+
+        # Bonus/replacement token at position `accepted`.
+        row_idx = torch.arange(n, dtype=torch.long, device=self.device)
+        out[row_idx, accepted.long()] = self._merged_next_token_ids[:n]
+        return out
 
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
@@ -6053,6 +6099,15 @@ class GPUModelRunner(
             dtype=torch.int32,
             device=self.device,
         )
+        self._merged_sampled_token_ids = torch.full(
+            (num_reqs, max_query_len),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._merged_col_indices = torch.arange(
+            max_query_len, dtype=torch.int32, device=self.device
+        ).unsqueeze(0)
         # ── Bypass individual CUDAGraphWrappers ──
         cg._merged_capture_bypass = True
 
