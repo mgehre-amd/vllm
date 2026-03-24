@@ -369,7 +369,7 @@ torch::Tensor wvSplitK_int8(const at::Tensor& in_a, const at::Tensor& in_b,
 
 #define WVSPLIT_INT8_TILE(_sYT, __N) \
   {                                  \
-    if (__N >= 4 && _sYT >= 480)     \
+    if (__N >= 4 && _sYT >= 240)     \
       WVSPLITK_INT8(4, 1, __N)       \
     else                             \
       WVSPLITK_INT8(1, 4, __N)       \

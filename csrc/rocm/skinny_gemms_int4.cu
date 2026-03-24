@@ -671,11 +671,11 @@ torch::Tensor wvSplitK_int4(const at::Tensor& in_a, const at::Tensor& in_b,
 #define WVSPLIT_INT4_TILE(_sYT, __N)   \
   {                                    \
     if (K_in * N_in > max_lds_len) {   \
-      if (_sYT < 30)                   \
+      if (_sYT < 15)                   \
         WVSPLITK_INT4(4, 2, __N)       \
       else                             \
         WVSPLITK_INT4(4, 1, __N)       \
-    } else if (__N == 1 && _sYT >= 30) \
+    } else if (__N == 1 && _sYT >= 15) \
       WVSPLITK_INT4(2, 4, __N)         \
     else                               \
       WVSPLITK_INT4(1, 4, __N)         \
@@ -938,21 +938,21 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
 #define WVSPLIT_INT4G_TILE(_sYT, __N)                                 \
   {                                                                   \
     if (K_in * N_in > max_lds_len) {                                  \
-      if (_sYT < 30)                                                  \
+      if (_sYT < 15)                                                  \
         WVSPLIT_INT4G_GS(4, 2, __N)                                   \
       else                                                            \
         WVSPLIT_INT4G_GS(4, 1, __N)                                   \
-    } else if (__N >= 4 && _sYT >= 480)                               \
+    } else if (__N >= 4 && _sYT >= 240)                               \
       WVSPLIT_INT4G_GS(4, 1, __N)                                     \
-    else if (__N >= 3 && _sYT >= 40)                                  \
+    else if (__N >= 3 && _sYT >= 20)                                  \
       WVSPLIT_INT4G_GS(4, 1, __N)                                     \
-    else if (__N >= 3 && _sYT < 40 && (K_in <= 2048 || K_in >= 4096)) \
+    else if (__N >= 3 && _sYT < 20 && (K_in <= 2048 || K_in >= 4096)) \
       WVSPLIT_INT4G_GS(2, 4, __N)                                     \
-    else if (__N >= 3 && _sYT < 40)                                   \
+    else if (__N >= 3 && _sYT < 20)                                   \
       WVSPLIT_INT4G_GS(2, 2, __N)                                     \
     else if (__N >= 2)                                                \
       WVSPLIT_INT4G_GS(2, 2, __N)                                     \
-    else if (_sYT >= 30)                                              \
+    else if (_sYT >= 15)                                              \
       WVSPLIT_INT4G_GS(2, 4, __N)                                     \
     else                                                              \
       WVSPLIT_INT4G_GS(1, 4, __N)                                     \
