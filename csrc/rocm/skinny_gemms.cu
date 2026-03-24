@@ -1290,9 +1290,9 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
         WVSPLITK(1, 4, __N)                                          \
       else if (K_in < 1024)                                          \
         WVSPLITK(2, 4, __N)                                          \
-      else if ((K_in % 1024 == 512) && (_sYT >= 40 || K_in >= 4096)) \
+      else if ((K_in % 1024 == 512) && (_sYT >= 20 || K_in >= 4096)) \
         WVSPLITK(4, 1, __N)                                          \
-      else if (K_in <= 2048 && (__N >= 2 || _sYT <= 26))             \
+      else if (K_in <= 2048 && (__N >= 2 || _sYT <= 13))             \
         WVSPLITK(1, 4, __N)                                          \
       else if (__N >= 2 && !fit_lds)                                 \
         WVSPLITK(1, 4, __N)                                          \

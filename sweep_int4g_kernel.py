@@ -411,11 +411,11 @@ def analyze_results(csv_path, best_per_shape, medium_only=False):
         best = min(rows_for_shape, key=lambda r: r["time_us"])
 
         sYT = (M + cu_count * 4 - 1) // (cu_count * 4)
-        if N >= 4 and sYT >= 480:
+        if N >= 4 and sYT >= 240 or N >= 3 and sYT >= 20:
             heur_yt, heur_ur = 4, 1
         elif N >= 2:
             heur_yt, heur_ur = 2, 2
-        elif sYT >= 30:
+        elif sYT >= 15:
             heur_yt, heur_ur = 2, 4
         else:
             heur_yt, heur_ur = 1, 4

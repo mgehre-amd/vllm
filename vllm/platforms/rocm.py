@@ -887,7 +887,10 @@ class RocmPlatform(Platform):
 
     @classmethod
     def num_compute_units(cls, device_id: int = 0) -> int:
-        return torch.cuda.get_device_properties(device_id).multi_processor_count
+        # multi_processor_count returns WGPs on RDNA (gfx11/gfx12).
+        # Each WGP contains 2 CUs, so multiply by 2.
+        wgps = torch.cuda.get_device_properties(device_id).multi_processor_count
+        return wgps * 2 if _ON_GFX1X else wgps
 
     @classmethod
     def use_custom_op_collectives(cls) -> bool:
