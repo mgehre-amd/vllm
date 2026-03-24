@@ -88,23 +88,37 @@ def int4_kernel_variant(M, K, N):
 
 
 def kernel_variant(M, K, N, cu_count):
-    """Determine which kernel variant wvSplitK dispatches to on gfx11."""
+    """Determine which kernel variant wvSplitK dispatches to on gfx11.
+
+    Tuned for RDNA 3.5 with CuCount = num_CUs (40 on Strix Halo).
+    """
     prod = K * N
     sYT = (M + cu_count * 4 - 1) // (cu_count * 4)
-    fit_lds = prod <= LDS_SIZE_HALF
 
     if sYT <= 1:
         ytile, unrl = 1, 4
-    elif K < 1024:
-        ytile, unrl = 2, 4
-    elif K % 1024 == 512 and (sYT >= 20 or K >= 4096):
-        ytile, unrl = 4, 1
-    elif K <= 2048 and (N >= 2 or sYT <= 13) or N >= 2 and not fit_lds:
-        ytile, unrl = 1, 4
-    elif N == 1:
-        ytile, unrl = 1, 2
+    elif sYT <= 13:
+        ytile, unrl = (1, 4) if K <= 2048 else (1, 1)
+    elif K <= 2048:
+        if sYT <= 16:
+            ytile, unrl = 1, 2
+        elif sYT <= 26:
+            ytile, unrl = 1, 4
+        else:
+            ytile, unrl = 1, 1
+    elif K <= 3584:
+        if sYT >= 237:
+            ytile, unrl = 4, 1
+        elif sYT <= 39 and M % 3 == 0:
+            ytile, unrl = 3, 2
+        else:
+            ytile, unrl = 1, 2
     else:
-        ytile, unrl = 1, 1
+        # K >= 4096
+        if sYT >= 237:
+            ytile, unrl = 4, 1
+        else:
+            ytile, unrl = 1, 1
 
     if prod <= LDS_SIZE_HALF and M % ytile == 0:
         variant = "sml"

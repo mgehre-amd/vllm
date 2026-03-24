@@ -1282,36 +1282,50 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
   else                                     \
     WVSPLITK_LAUNCH(64, _YTILE, _UNRL, _N)
 
-#define WVSPLIT_TILE(_sYT, __N)                                      \
-  {                                                                  \
-    bool fit_lds = (Kbp_in * N_in <= max_lds_len);                   \
-    if (is_gfx11()) {                                                \
-      if (_sYT <= 1)                                                 \
-        WVSPLITK(1, 4, __N)                                          \
-      else if (K_in < 1024)                                          \
-        WVSPLITK(2, 4, __N)                                          \
-      else if ((K_in % 1024 == 512) && (_sYT >= 20 || K_in >= 4096)) \
-        WVSPLITK(4, 1, __N)                                          \
-      else if (K_in <= 2048 && (__N >= 2 || _sYT <= 13))             \
-        WVSPLITK(1, 4, __N)                                          \
-      else if (__N >= 2 && !fit_lds)                                 \
-        WVSPLITK(1, 4, __N)                                          \
-      else if (__N == 1)                                             \
-        WVSPLITK(1, 2, __N)                                          \
-      else                                                           \
-        WVSPLITK(1, 1, __N)                                          \
-    } else {                                                         \
-      if (_sYT <= 1)                                                 \
-        WVSPLITK(1, 4, __N)                                          \
-      else if ((__N == 1) || (!fit_lds) || (_sYT <= 4 * 2))          \
-        WVSPLITK(2, 2, __N)                                          \
-      else if (_sYT <= 4 * 3)                                        \
-        WVSPLITK(3, 2, __N)                                          \
-      else if (__N == 4)                                             \
-        WVSPLITK(4, 1, __N)                                          \
-      else                                                           \
-        WVSPLITK(4, 2, __N)                                          \
-    }                                                                \
+#define WVSPLIT_TILE(_sYT, __N)                                     \
+  {                                                                 \
+    if (is_gfx11()) {                                               \
+      /* Tuned for RDNA 3.5 with CuCount = num_CUs (40 on Strix) */ \
+      if (_sYT <= 1)                                                \
+        WVSPLITK(1, 4, __N)                                         \
+      else if (_sYT <= 13) {                                        \
+        if (K_in <= 2048)                                           \
+          WVSPLITK(1, 4, __N)                                       \
+        else                                                        \
+          WVSPLITK(1, 1, __N)                                       \
+      } else if (K_in <= 2048) {                                    \
+        if (_sYT <= 16)                                             \
+          WVSPLITK(1, 2, __N)                                       \
+        else if (_sYT <= 26)                                        \
+          WVSPLITK(1, 4, __N)                                       \
+        else                                                        \
+          WVSPLITK(1, 1, __N)                                       \
+      } else if (K_in <= 3584) {                                    \
+        if (_sYT >= 237)                                            \
+          WVSPLITK(4, 1, __N)                                       \
+        else if (_sYT <= 39 && (M_in % 3 == 0))                     \
+          WVSPLITK(3, 2, __N)                                       \
+        else                                                        \
+          WVSPLITK(1, 2, __N)                                       \
+      } else {                                                      \
+        /* K >= 4096 */                                             \
+        if (_sYT >= 237)                                            \
+          WVSPLITK(4, 1, __N)                                       \
+        else                                                        \
+          WVSPLITK(1, 1, __N)                                       \
+      }                                                             \
+    } else {                                                        \
+      if (_sYT <= 1)                                                \
+        WVSPLITK(1, 4, __N)                                         \
+      else if ((__N == 1) || (_sYT <= 4 * 2))                       \
+        WVSPLITK(2, 2, __N)                                         \
+      else if (_sYT <= 4 * 3)                                       \
+        WVSPLITK(3, 2, __N)                                         \
+      else if (__N == 4)                                            \
+        WVSPLITK(4, 1, __N)                                         \
+      else                                                          \
+        WVSPLITK(4, 2, __N)                                         \
+    }                                                               \
   }
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(in_b.scalar_type(), "wvSplitK", [&] {
@@ -1350,9 +1364,7 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
   return out_c;
 }
 
-// Sweep function disabled by default to reduce compile time.
-// Build with -DVLLM_SKINNY_GEMM_SWEEP to enable.
-#ifdef VLLM_SKINNY_GEMM_SWEEP
+// Sweep function: accepts ytile/unrl as runtime parameters for benchmarking.
 torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,
                              const std::optional<at::Tensor>& in_bias,
                              const int64_t CuCount, const int64_t ytile,
@@ -1387,64 +1399,64 @@ torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int max_lds_len = get_lds_size() / 2;
 
-  #define WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, _N)                  \
-    {                                                                       \
-      dim3 block(_THRDS, 16);                                               \
-      int __wvPrGrp = mindiv(M_in, CuCount * _YTILE, 16);                   \
-      if ((Kbp_in * N_in <= max_lds_len) && (M_in % _YTILE == 0))           \
-        wvSplitK_hf_sml_<fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>          \
-            <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in, \
-                                         By_in, af4, bf4, biasf4, c,        \
-                                         __wvPrGrp, CuCount);               \
-      else if (Kbp_in * N_in <= max_lds_len * 1.2)                          \
-        wvSplitK_hf_<fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>              \
-            <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in, \
-                                         By_in, af4, bf4, biasf4, c,        \
-                                         __wvPrGrp, CuCount);               \
-      else                                                                  \
-        wvSplitK_hf_big_<fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>          \
-            <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in, \
-                                         By_in, af4, bf4, biasf4, c,        \
-                                         __wvPrGrp, CuCount);               \
-    }
+#define WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, _N)                      \
+  {                                                                           \
+    dim3 block(_THRDS, 16);                                                   \
+    int __wvPrGrp = mindiv(M_in, CuCount * _YTILE, 16);                       \
+    if ((Kbp_in * N_in <= max_lds_len) && (M_in % _YTILE == 0))               \
+      wvSplitK_hf_sml_<fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>              \
+          <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
+                                       By_in, af4, bf4, biasf4, c, __wvPrGrp, \
+                                       CuCount);                              \
+    else if (Kbp_in * N_in <= max_lds_len * 1.2)                              \
+      wvSplitK_hf_<fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>                  \
+          <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
+                                       By_in, af4, bf4, biasf4, c, __wvPrGrp, \
+                                       CuCount);                              \
+    else                                                                      \
+      wvSplitK_hf_big_<fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>              \
+          <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
+                                       By_in, af4, bf4, biasf4, c, __wvPrGrp, \
+                                       CuCount);                              \
+  }
 
-  #define WVSPLITK_SWEEP_N(_THRDS, _YTILE, _UNRL)              \
-    switch (N_in) {                                            \
-      case 1:                                                  \
-        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 1) break; \
-      case 2:                                                  \
-        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 2) break; \
-      case 3:                                                  \
-        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 3) break; \
-      case 4:                                                  \
-        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 4) break; \
-      default:                                                 \
-        TORCH_CHECK(false, "Unsupported N=", N_in);            \
-    }
+#define WVSPLITK_SWEEP_N(_THRDS, _YTILE, _UNRL)              \
+  switch (N_in) {                                            \
+    case 1:                                                  \
+      WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 1) break; \
+    case 2:                                                  \
+      WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 2) break; \
+    case 3:                                                  \
+      WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 3) break; \
+    case 4:                                                  \
+      WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 4) break; \
+    default:                                                 \
+      TORCH_CHECK(false, "Unsupported N=", N_in);            \
+  }
 
-  #define WVSPLITK_SWEEP_UNRL(_THRDS, _YTILE)        \
-    if (unrl == 1) {                                 \
-      WVSPLITK_SWEEP_N(_THRDS, _YTILE, 1)            \
-    } else if (unrl == 2) {                          \
-      WVSPLITK_SWEEP_N(_THRDS, _YTILE, 2)            \
-    } else if (unrl == 4) {                          \
-      WVSPLITK_SWEEP_N(_THRDS, _YTILE, 4)            \
-    } else {                                         \
-      TORCH_CHECK(false, "Unsupported unrl=", unrl); \
-    }
+#define WVSPLITK_SWEEP_UNRL(_THRDS, _YTILE)        \
+  if (unrl == 1) {                                 \
+    WVSPLITK_SWEEP_N(_THRDS, _YTILE, 1)            \
+  } else if (unrl == 2) {                          \
+    WVSPLITK_SWEEP_N(_THRDS, _YTILE, 2)            \
+  } else if (unrl == 4) {                          \
+    WVSPLITK_SWEEP_N(_THRDS, _YTILE, 4)            \
+  } else {                                         \
+    TORCH_CHECK(false, "Unsupported unrl=", unrl); \
+  }
 
-  #define WVSPLITK_SWEEP_YTILE(_THRDS)                 \
-    if (ytile == 1) {                                  \
-      WVSPLITK_SWEEP_UNRL(_THRDS, 1)                   \
-    } else if (ytile == 2) {                           \
-      WVSPLITK_SWEEP_UNRL(_THRDS, 2)                   \
-    } else if (ytile == 3) {                           \
-      WVSPLITK_SWEEP_UNRL(_THRDS, 3)                   \
-    } else if (ytile == 4) {                           \
-      WVSPLITK_SWEEP_UNRL(_THRDS, 4)                   \
-    } else {                                           \
-      TORCH_CHECK(false, "Unsupported ytile=", ytile); \
-    }
+#define WVSPLITK_SWEEP_YTILE(_THRDS)                 \
+  if (ytile == 1) {                                  \
+    WVSPLITK_SWEEP_UNRL(_THRDS, 1)                   \
+  } else if (ytile == 2) {                           \
+    WVSPLITK_SWEEP_UNRL(_THRDS, 2)                   \
+  } else if (ytile == 3) {                           \
+    WVSPLITK_SWEEP_UNRL(_THRDS, 3)                   \
+  } else if (ytile == 4) {                           \
+    WVSPLITK_SWEEP_UNRL(_THRDS, 4)                   \
+  } else {                                           \
+    TORCH_CHECK(false, "Unsupported ytile=", ytile); \
+  }
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(in_b.scalar_type(), "wvSplitK_sweep", [&] {
     using fptype = typename scalar<scalar_t>::type;
@@ -1463,14 +1475,13 @@ torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,
     }
   });
 
-  #undef WVSPLITK_SWEEP_LAUNCH
-  #undef WVSPLITK_SWEEP_N
-  #undef WVSPLITK_SWEEP_UNRL
-  #undef WVSPLITK_SWEEP_YTILE
+#undef WVSPLITK_SWEEP_LAUNCH
+#undef WVSPLITK_SWEEP_N
+#undef WVSPLITK_SWEEP_UNRL
+#undef WVSPLITK_SWEEP_YTILE
 
   return out_c;
 }
-#endif  // VLLM_SKINNY_GEMM_SWEEP
 
 // This version targets cases skinny where CUs are not filled
 // Wave-SplitK is used with reduction done via atomics.
