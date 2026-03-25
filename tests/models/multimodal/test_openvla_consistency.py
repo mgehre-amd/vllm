@@ -7,7 +7,10 @@ OpenVLA is a Vision-Language-Action model that outputs 7 discretized action toke
 (xyz, rpy, gripper) with 256 bins each (vocabulary positions [32000, 32255]).
 
 Expected result: 4/5 exact token match (80%) - same as SGLang implementation.
-Sample 3 fails due to low model confidence (0.125 logprob gap at step 4).
+Sample 3 (index 3, "place the object on the table") diverges from HF reference.
+Empirically measured on the deterministic test image (seed=42): the model's
+top-1 vs top-2 logprob gap at step 4 is only 0.125, making it sensitive to
+minor numerical differences between vLLM and HF inference paths.
 
 Usage:
     pytest tests/models/multimodal/test_openvla_consistency.py -v
@@ -149,6 +152,7 @@ def hf_reference_tokens(test_image):
     return references
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("instruction,expected_result", TEST_CASES)
 def test_openvla_token_consistency(
     vllm_model,
@@ -184,6 +188,7 @@ def test_openvla_token_consistency(
             assert 32000 <= token <= 32255, f"Token {token} outside action range"
 
 
+@pytest.mark.slow
 def test_openvla_overall_accuracy(
     vllm_model,
     test_image,
@@ -250,7 +255,7 @@ if __name__ == "__main__":
         else:
             status = f"DIFF ({matches}/7 tokens)"
 
-        symbol = "✓" if is_exact else "✗"
+        symbol = "OK" if is_exact else "FAIL"
         print(f"Sample {i}: {symbol} {status}")
         print(f"  Instruction: {instruction}")
         print(f"  vLLM: {vllm_tokens}")

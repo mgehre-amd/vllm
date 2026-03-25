@@ -66,7 +66,7 @@ class StreamedResponseHandler:
 class RequestFuncInput:
     """The input for the request function."""
 
-    prompt: str | list[str]
+    prompt: str | list[str] | list[dict[str, Any]]
     api_url: str
     prompt_len: int
     output_len: int
@@ -272,6 +272,7 @@ def _get_chat_content(
     # messages: [{"role": "user", "content": [{"type": "text", "text": "..."},
     # {"type": "image_url", ...}]}]. Use content directly to avoid wrapping
     # a list as "text" (which causes 400 Bad Request).
+    # Note: expects exactly one user message (matches CustomMMDataset output).
     if isinstance(prompt, list) and len(prompt) > 0:
         first = prompt[0]
         if (
@@ -400,30 +401,6 @@ async def async_request_openai_chat_completions(
                                     )
 
                                 most_recent_timestamp = timestamp
-
-                    # Fallback: server may return non-streaming JSON in one chunk
-                    # (e.g. OpenVLA) when stream=True.
-                    if (
-                        not generated_text
-                        and handler.buffer.strip()
-                        and not handler.buffer.strip().startswith("data:")
-                    ):
-                        try:
-                            body = json.loads(handler.buffer.strip())
-                            msg = (body.get("choices") or [{}])[0].get("message") or {}
-                            generated_text = msg.get("content") or ""
-                            if usage := body.get("usage"):
-                                output.output_tokens = (
-                                    usage.get("completion_tokens") or 0
-                                )
-                            lat = time.perf_counter() - st
-                            if output.output_tokens and output.output_tokens > 0:
-                                inferred = lat / output.output_tokens
-                                output.ttft = inferred
-                                output.itl = [inferred] * (output.output_tokens - 1)
-                            most_recent_timestamp = time.perf_counter()
-                        except (json.JSONDecodeError, KeyError):
-                            pass
 
                     output.generated_text = generated_text
                     output.success = True

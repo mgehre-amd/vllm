@@ -442,12 +442,6 @@ def calculate_metrics(
             total_input += input_requests[i].prompt_len
             ttft = outputs[i].ttft
             itl_list = list(outputs[i].itl)
-            # Fallback: some models (e.g. VLA/OpenVLA) may not stream token chunks,
-            # so ttft=0 and itl=[] despite generating tokens. Infer from latency.
-            if output_len > 0 and ttft == 0.0 and not itl_list:
-                inferred_ttft = outputs[i].latency / output_len
-                ttft = inferred_ttft
-                itl_list = [inferred_ttft] * (output_len - 1)
             tpot = 0
             if output_len > 1:
                 latency_minus_ttft = outputs[i].latency - ttft
