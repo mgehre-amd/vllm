@@ -511,13 +511,15 @@ class OpenVLAMultiModalProcessor(BaseMultiModalProcessor[OpenVLAProcessingInfo])
                 embed_token_id=image_token_id,
             )
 
-        # Insert image tokens at the very start of the prompt.
-        # Using start() instead of prefix([bos]) because the chat API path
-        # tokenizes without add_special_tokens, so BOS may be absent.
+        # Insert image tokens after BOS to match the HF OpenVLA prompt
+        # layout: [BOS, image_tokens x 256, text_tokens...].
+        # Using start() would place images before BOS, shifting every RoPE
+        # position by one and producing incorrect action tokens.
+        bos_token_id = self.info.get_tokenizer().bos_token_id or 1
         return [
             PromptInsertion(
                 modality="image",
-                target=PromptIndexTargets.start(),
+                target=PromptIndexTargets.prefix([bos_token_id]),
                 insertion=get_insertion,
             ),
         ]
