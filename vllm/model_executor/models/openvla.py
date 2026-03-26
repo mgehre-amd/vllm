@@ -496,7 +496,6 @@ class OpenVLAMultiModalProcessor(BaseMultiModalProcessor[OpenVLAProcessingInfo])
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
         hf_config = self.info.get_hf_config()
-        # Use image_token_index (32000) as placeholder for image features
         image_token_id = getattr(hf_config, "image_token_index", 32000)
 
         def get_insertion(item_idx: int):
@@ -540,7 +539,7 @@ class OpenVLAForActionPrediction(nn.Module, SupportsMultiModal, SupportsPP):
 
     Action prediction:
     - 7D action space: [dx, dy, dz, drx, dry, drz, gripper]
-    - 256 bins per dimension (tokens 32000-32255 in Llama vocab)
+    - 256 bins per dimension (token IDs 31744-31999 in Llama vocab)
     - Autoregressive generation of 7 action tokens
     """
 
