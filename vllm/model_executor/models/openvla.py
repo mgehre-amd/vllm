@@ -40,8 +40,7 @@ from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
     BaseProcessingInfo,
-    PromptIndexTargets,
-    PromptInsertion,
+    PromptReplacement,
     PromptUpdate,
     PromptUpdateDetails,
 )
@@ -303,8 +302,9 @@ class OpenVLADummyInputsBuilder(BaseDummyInputsBuilder[OpenVLAProcessingInfo]):
     """Builds dummy inputs for profiling OpenVLA."""
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
-        # Empty string - image tokens are inserted at prefix, not as replacement
-        return ""
+        num_images = mm_counts.get("image", 0)
+        # OpenVLA uses <PAD> (token 32000) as the image placeholder token
+        return "<PAD>" * num_images
 
     def get_dummy_mm_data(
         self,
@@ -498,7 +498,7 @@ class OpenVLAMultiModalProcessor(BaseMultiModalProcessor[OpenVLAProcessingInfo])
         hf_config = self.info.get_hf_config()
         image_token_id = getattr(hf_config, "image_token_index", 32000)
 
-        def get_insertion(item_idx: int):
+        def get_replacement(item_idx: int):
             num_image_tokens = self.info.get_num_image_tokens(
                 image_width=224,
                 image_height=224,
@@ -510,16 +510,11 @@ class OpenVLAMultiModalProcessor(BaseMultiModalProcessor[OpenVLAProcessingInfo])
                 embed_token_id=image_token_id,
             )
 
-        # Insert image tokens after BOS to match the HF OpenVLA prompt
-        # layout: [BOS, image_tokens x 256, text_tokens...].
-        # Using start() would place images before BOS, shifting every RoPE
-        # position by one and producing incorrect action tokens.
-        bos_token_id = self.info.get_tokenizer().bos_token_id or 1
         return [
-            PromptInsertion(
+            PromptReplacement(
                 modality="image",
-                target=PromptIndexTargets.prefix([bos_token_id]),
-                insertion=get_insertion,
+                target=[image_token_id],
+                replacement=get_replacement,
             ),
         ]
 
@@ -558,9 +553,8 @@ class OpenVLAForActionPrediction(nn.Module, SupportsMultiModal, SupportsPP):
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
-            # Return None because image tokens are inserted at prefix,
-            # not replaced from a placeholder string in the prompt
-            return None
+            # OpenVLA uses <PAD> (token 32000) as the image placeholder
+            return "<PAD>"
         raise ValueError("Only image modality is supported")
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:

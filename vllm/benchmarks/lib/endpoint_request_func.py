@@ -34,9 +34,7 @@ class StreamedResponseHandler:
 
         messages = []
 
-        # Split by double newlines (SSE message separator).
-        # Support both \n\n and \r\n\r\n (HTTP-style).
-        self.buffer = self.buffer.replace("\r\n", "\n")
+        # Split by double newlines (SSE message separator)
         while "\n\n" in self.buffer:
             message, self.buffer = self.buffer.split("\n\n", 1)
             message = message.strip()
@@ -66,7 +64,7 @@ class StreamedResponseHandler:
 class RequestFuncInput:
     """The input for the request function."""
 
-    prompt: str | list[str] | list[dict[str, Any]]
+    prompt: str | list[str]
     api_url: str
     prompt_len: int
     output_len: int
@@ -266,28 +264,7 @@ def _get_chat_content(
     request_func_input: RequestFuncInput,
     mm_position: Literal["first", "last"] = "last",
 ) -> list[dict[str, Any]]:
-    prompt = request_func_input.prompt
-
-    # When enable_multimodal_chat=True, CustomMMDataset passes preformatted
-    # messages: [{"role": "user", "content": [{"type": "text", "text": "..."},
-    # {"type": "image_url", ...}]}]. Use content directly to avoid wrapping
-    # a list as "text" (which causes 400 Bad Request).
-    # Note: expects exactly one user message (matches CustomMMDataset output).
-    if isinstance(prompt, list) and len(prompt) > 0:
-        first = prompt[0]
-        if (
-            isinstance(first, dict)
-            and first.get("role") == "user"
-            and "content" in first
-        ):
-            content = first["content"]
-            if mm_position == "first" and isinstance(content, list):
-                text_items = [c for c in content if c.get("type") == "text"]
-                mm_items = [c for c in content if c.get("type") != "text"]
-                return mm_items + text_items
-            return content if isinstance(content, list) else [content]
-
-    text_contents = [{"type": "text", "text": prompt}]
+    text_contents = [{"type": "text", "text": request_func_input.prompt}]
 
     mm_contents = []
     if request_func_input.multi_modal_content:
@@ -333,10 +310,6 @@ async def async_request_openai_chat_completions(
     }
     _update_payload_common(payload, request_func_input)
 
-    use_streaming = payload.get("stream", True)
-    if "stream_options" in payload and not use_streaming:
-        payload.pop("stream_options", None)
-
     headers = _get_headers("application/json")
     _update_headers_common(headers, request_func_input)
 
@@ -351,60 +324,46 @@ async def async_request_openai_chat_completions(
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
             if response.status == 200:
-                if not use_streaming:
-                    body = await response.json()
-                    output.generated_text = (body.get("choices") or [{}])[0].get(
-                        "message", {}
-                    ).get("content", "") or ""
-                    if usage := body.get("usage"):
-                        output.output_tokens = usage.get("completion_tokens") or 0
-                    output.success = True
-                    output.latency = time.perf_counter() - st
-                else:
-                    handler = StreamedResponseHandler()
-                    async for chunk_bytes in response.content.iter_any():
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
+                handler = StreamedResponseHandler()
+                async for chunk_bytes in response.content.iter_any():
+                    chunk_bytes = chunk_bytes.strip()
+                    if not chunk_bytes:
+                        continue
+
+                    messages = handler.add_chunk(chunk_bytes)
+                    for message in messages:
+                        # NOTE: SSE comments (often used as pings) start with
+                        # a colon. These are not JSON data payload and should
+                        # be skipped.
+                        if message.startswith(":"):
                             continue
 
-                        messages = handler.add_chunk(chunk_bytes)
-                        for message in messages:
-                            # NOTE: SSE comments (often used as pings) start with
-                            # a colon. These are not JSON data payload and should
-                            # be skipped.
-                            if message.startswith(":"):
-                                continue
+                        chunk = message.removeprefix("data: ")
 
-                            chunk = message.removeprefix("data: ")
+                        if chunk != "[DONE]":
+                            timestamp = time.perf_counter()
+                            data = json.loads(chunk)
 
-                            if chunk != "[DONE]":
-                                timestamp = time.perf_counter()
-                                data = json.loads(chunk)
+                            if choices := data.get("choices"):
+                                content = choices[0]["delta"].get("content")
+                                # First token
+                                if ttft == 0.0:
+                                    ttft = timestamp - st
+                                    output.ttft = ttft
 
-                                if choices := data.get("choices"):
-                                    content = choices[0]["delta"].get("content")
-                                    # First token
-                                    if ttft == 0.0:
-                                        ttft = timestamp - st
-                                        output.ttft = ttft
+                                # Decoding phase
+                                else:
+                                    output.itl.append(timestamp - most_recent_timestamp)
 
-                                    # Decoding phase
-                                    else:
-                                        output.itl.append(
-                                            timestamp - most_recent_timestamp
-                                        )
+                                generated_text += content or ""
+                            elif usage := data.get("usage"):
+                                output.output_tokens = usage.get("completion_tokens")
 
-                                    generated_text += content or ""
-                                elif usage := data.get("usage"):
-                                    output.output_tokens = usage.get(
-                                        "completion_tokens"
-                                    )
+                            most_recent_timestamp = timestamp
 
-                                most_recent_timestamp = timestamp
-
-                    output.generated_text = generated_text
-                    output.success = True
-                    output.latency = most_recent_timestamp - st
+                output.generated_text = generated_text
+                output.success = True
+                output.latency = most_recent_timestamp - st
             else:
                 output.error = response.reason or ""
                 output.success = False

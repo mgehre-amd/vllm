@@ -62,7 +62,7 @@ def format_prompt(instruction: str) -> str:
 
     Note: Trailing space is required for HF compatibility.
     """
-    return f"In: What action should the robot take to {instruction}?\nOut: "
+    return f"<PAD>In: What action should the robot take to {instruction}?\nOut: "
 
 
 def get_vllm_tokens(

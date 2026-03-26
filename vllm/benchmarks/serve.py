@@ -440,17 +440,15 @@ def calculate_metrics(
                     )
             actual_output_lens.append(output_len)
             total_input += input_requests[i].prompt_len
-            ttft = outputs[i].ttft
-            itl_list = list(outputs[i].itl)
             tpot = 0
             if output_len > 1:
-                latency_minus_ttft = outputs[i].latency - ttft
+                latency_minus_ttft = outputs[i].latency - outputs[i].ttft
                 tpot = latency_minus_ttft / (output_len - 1)
                 tpots.append(tpot)
             # Note: if output_len <= 1, we regard tpot as 0 for goodput
             all_tpots.append(tpot)
-            itls += itl_list
-            ttfts.append(ttft)
+            itls += outputs[i].itl
+            ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
             input_audio_duration += outputs[i].input_audio_duration
             completed += 1
