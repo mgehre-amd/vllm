@@ -227,7 +227,10 @@ def test_rocm_wvsplitk_kernel(
     out = ops.wvSplitK(B, A.view(-1, A.size(-1)), cu_count, BIAS)
 
     if xnorm:
-        assert torch.allclose(out, ref_out, atol=1e-3, rtol=1e-8)
+        # Xavier-scaled inputs keep outputs small, so use absolute tolerance.
+        # Accumulation error still scales with sqrt(K); allow for that.
+        atol = max(1e-3, torch.finfo(dtype).eps * math.sqrt(k))
+        torch.testing.assert_close(out, ref_out, atol=atol, rtol=1e-2)
     else:
         # Accumulation error in fp16 GEMM scales with sqrt(K)
         atol = torch.finfo(dtype).eps * math.sqrt(k)

@@ -11,9 +11,6 @@ Run `pytest tests/kernels/quantization/test_rocm_compressed_tensors_w4a16.py`.
 
 import pytest
 
-from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
-    HybridW4A16LinearKernel,
-)
 from vllm.platforms import current_platform
 
 
@@ -34,14 +31,8 @@ def test_rocm_compressed_tensors_w4a16_e2e(
     with vllm_runner(
         model_path, dtype="float16", gpu_memory_utilization=0.3
     ) as vllm_model:
-        # Verify HybridW4A16LinearKernel was selected (not a silent fallback)
-        model = (
-            vllm_model.model.llm_engine.model_executor.driver_worker.model_runner.model
-        )  # noqa: E501
-        first_linear = model.model.layers[0].self_attn.qkv_proj
-        assert isinstance(first_linear.kernel, HybridW4A16LinearKernel), (
-            f"Expected HybridW4A16LinearKernel, got {type(first_linear.kernel)}"
-        )
-
-        # If the W4A16 kernel is broken, this will typically throw.
+        # Note: we cannot assert HybridW4A16LinearKernel is selected here
+        # because V1 engine runs the model in a subprocess and apply_model
+        # requires serializable callables (msgpack can't serialize functions).
+        # If the W4A16 kernel is broken, generate_greedy will throw.
         vllm_model.generate_greedy(example_prompts, max_tokens=max_tokens)
