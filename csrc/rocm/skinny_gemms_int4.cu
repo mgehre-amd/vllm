@@ -144,14 +144,15 @@ __device__ inline unsigned int min__(uint32_t a, uint32_t b) {
 // All pointers are for a single expert; the caller offsets them.
 #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N, int GROUP_SIZE = 0, bool HAS_ZERO_POINTS = false>
+          int UNRL, int N, int GROUP_SIZE = 0, bool HAS_ZERO_POINTS = false,
+          int LDS_ELEMS = LDS_SIZE / 2>
 __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
     const int K, const int M, const int Bx, const int By,
     const uint8_t* B_packed, const scalar_t* __restrict__ A,
     const scalar_t* scale, const scalar_t* zero_points,
     const scalar_t* __restrict__ BIAS, scalar_t* C, const int _WvPrGrp,
     const int CuCount) {
-  constexpr int max_lds_len = LDS_SIZE / 2;
+  constexpr int max_lds_len = LDS_ELEMS;
   const int K_packed = K / 2;
 
   union bigTypeA {
@@ -1120,6 +1121,12 @@ torch::Tensor wvSplitK_int4_sweep(const at::Tensor& in_a,
 // offset pointers per expert, then call the shared compute body.
 // Grid: dim3(CuCount, num_expert_blocks).
 // Activations must be pre-permuted so each expert's rows are contiguous.
+
+// Reduced LDS for MoE: 8192 elements = 16KB bf16.  Covers N*K up to 8192
+// (e.g. N=4, K=2048).  Reduces LDS from 64KB→16KB, allowing more concurrent
+// workgroups per CU.
+constexpr int MOE_LDS_ELEMS = 8192;
+
 #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
           int UNRL, int N, int GROUP_SIZE = 0, bool HAS_ZERO_POINTS = false>
@@ -1143,7 +1150,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_wvSplitK_int4_hf_sml_(
   scalar_t* C = C_base + base_row * M;
 
   wvSplitK_int4_compute_sml_<scalar_t, THRDS, YTILE, WvPrGrp, A_CHUNK, UNRL, N,
-                             GROUP_SIZE, HAS_ZERO_POINTS>(
+                             GROUP_SIZE, HAS_ZERO_POINTS, MOE_LDS_ELEMS>(
       K, M, 1, 1, B, A, S, ZP, nullptr, C, _WvPrGrp, CuCount);
 }
 
@@ -1211,7 +1218,7 @@ __global__ void moe_wvSplitK_int4_hf_(
     dim3 block(_THRDS, 16);                                                   \
     int __wvPrGrp = mindiv_int4(M_in, moe_cu * _YTILE, 16);                   \
     dim3 grid(moe_cu, num_expert_blocks);                                     \
-    if (K_in * _N <= max_lds_len && M_in % _YTILE == 0)                       \
+    if (K_in * _N <= MOE_LDS_ELEMS && M_in % _YTILE == 0)                     \
       moe_wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, 16, 16, _UNRL, _N,    \
                                 _GS, _HAS_ZP><<<grid, block, 0, stream>>>(    \
           K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, expert_stride_w, \
