@@ -1234,28 +1234,31 @@ __global__ void moe_wvSplitK_int4_hf_(
 //   expert_stride_w, expert_stride_s, expert_stride_zp, stream, max_lds_len
 // Required type: fptype, N_in (template constant via switch)
 
-#define MOE_WVSPLITK_INT4G_LAUNCH(_THRDS, _YTILE, _UNRL, _N, _GS, _HAS_ZP)    \
-  {                                                                           \
-    /* For MoE, use fewer CUs per expert block to increase inter-expert       \
-       parallelism.  With block_size_m=2, the M dimension per expert block is \
-       small, so fewer CUs can cover it with more M-loop iterations while     \
-       allowing the GPU scheduler to run more expert blocks concurrently. */  \
-    int moe_cu = max(CuCount / 8, 2);                                         \
-    dim3 block(_THRDS, 16);                                                   \
-    int __wvPrGrp = mindiv_int4(M_in, moe_cu * _YTILE, 16);                   \
-    dim3 grid(moe_cu, num_expert_blocks);                                     \
-    if (K_in * _N <= MOE_LDS_ELEMS && M_in % _YTILE == 0)                     \
-      moe_wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, 16, 16, _UNRL, _N,    \
-                                _GS, _HAS_ZP><<<grid, block, 0, stream>>>(    \
-          K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr,         \
-          top_k_in, expert_stride_w, expert_stride_s, expert_stride_zp,       \
-          __wvPrGrp, moe_cu);                                                 \
-    else                                                                      \
-      moe_wvSplitK_int4_hf_<fptype, _THRDS, _YTILE, 16, 16, _UNRL, _N, _GS,   \
-                            _HAS_ZP><<<grid, block, 0, stream>>>(             \
-          K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr,         \
-          top_k_in, expert_stride_w, expert_stride_s, expert_stride_zp,       \
-          __wvPrGrp, moe_cu);                                                 \
+#define MOE_WVSPLITK_INT4G_LAUNCH(_THRDS, _YTILE, _UNRL, _N, _GS, _HAS_ZP)  \
+  {                                                                         \
+    /* For MoE decode, use CuCount/2 CUs per expert block. Sweep results    \
+       (Strix Halo 40 CUs, 8 active experts, Qwen3-30B-A3B w4a16):          \
+         CuCount/8=5  → 16.15ms  (too little per-expert bandwidth)        \
+         CuCount/4=10 → 13.74ms                                           \
+         CuCount/3=13 → 13.58ms                                           \
+         CuCount/2=20 → 13.41ms  (best: 2 experts concurrent)             \
+         CuCount=40   → 13.72ms  (too serialized) */                      \
+    int moe_cu = max(CuCount / 2, 2);                                       \
+    dim3 block(_THRDS, 16);                                                 \
+    int __wvPrGrp = mindiv_int4(M_in, moe_cu * _YTILE, 16);                 \
+    dim3 grid(moe_cu, num_expert_blocks);                                   \
+    if (K_in * _N <= MOE_LDS_ELEMS && M_in % _YTILE == 0)                   \
+      moe_wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, 16, 16, _UNRL, _N,  \
+                                _GS, _HAS_ZP><<<grid, block, 0, stream>>>(  \
+          K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr,       \
+          top_k_in, expert_stride_w, expert_stride_s, expert_stride_zp,     \
+          __wvPrGrp, moe_cu);                                               \
+    else                                                                    \
+      moe_wvSplitK_int4_hf_<fptype, _THRDS, _YTILE, 16, 16, _UNRL, _N, _GS, \
+                            _HAS_ZP><<<grid, block, 0, stream>>>(           \
+          K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr,       \
+          top_k_in, expert_stride_w, expert_stride_s, expert_stride_zp,     \
+          __wvPrGrp, moe_cu);                                               \
   }
 
 #define MOE_WVSPLITK_INT4G(_YTILE, _UNRL, _N, _GS, _HAS_ZP)        \
