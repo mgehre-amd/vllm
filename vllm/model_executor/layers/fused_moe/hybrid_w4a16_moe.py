@@ -206,10 +206,16 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
         num_slots = sorted_token_ids.size(0)
         P = num_tokens * top_k_num
 
-        # Pre-permute activations into contiguous expert blocks
-        source_rows = (sorted_token_ids // top_k_num).clamp(max=num_tokens - 1)
-        gemm1_in = _resize_cache(workspace13, (num_slots, K))
-        torch.index_select(hidden_states, 0, source_rows.long(), out=gemm1_in)
+        # For block_size_m=1 (decode), skip pre-permutation: the kernel
+        # indexes into unpermuted activations via sorted_token_ids.
+        # For block_size_m>1 (prefill), pre-permute into contiguous blocks.
+        scattered = block_size_m == 1
+        if scattered:
+            gemm1_in = hidden_states
+        else:
+            source_rows = (sorted_token_ids // top_k_num).clamp(max=num_tokens - 1)
+            gemm1_in = _resize_cache(workspace13, (num_slots, K))
+            torch.index_select(hidden_states, 0, source_rows.long(), out=gemm1_in)
 
         gemm1_out = _resize_cache(workspace2, (num_slots, N))
         act_out = _resize_cache(workspace13, (num_slots, activation_out_dim))
@@ -226,12 +232,18 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
             self._cu_count,
             self._group_size,
             self.quant_config.w1_zp,
+            sorted_token_ids if scattered else None,
+            top_k_num,
         )
 
         # Activation
         apply_moe_activation(activation, act_out, gemm1_out)
 
-        # GEMM 2
+        # GEMM 2: act_out is in slot order (scattered) or contiguous order.
+        # For scattered mode, act_out has data at scattered slot positions
+        # (written by GEMM1's scattered output + elementwise activation),
+        # so GEMM2 also needs sorted_token_ids with top_k=1 to read/write
+        # at the correct slot positions.
         fused_moe_wvSplitK_int4_gemm(
             act_out,
             w2,
@@ -242,28 +254,39 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
             self._cu_count,
             self._group_size,
             self.quant_config.w2_zp,
+            sorted_token_ids if scattered else None,
+            1,  # top_k=1: act_out slots are already in slot-space
         )
 
         # ---- Reduce via moe_unpermute ----
-        # Output is always in sorted (expert-contiguous) order, so we
-        # always need to invert sorted_token_ids to recover slot order.
-        # Cache the arange and inv_perm_buf to avoid re-allocation.
-        if self._cached_arange is None or self._cached_arange.size(0) < num_slots:
-            self._cached_arange = torch.arange(
-                num_slots, dtype=torch.int32, device=hidden_states.device
-            )
-        aligned_arange = self._cached_arange[:num_slots]
+        if scattered:
+            # Scattered kernel writes to c[sorted_token_ids[block]], so
+            # gemm2_out is in sequential slot order → identity mapping.
+            if self._cached_arange is None or self._cached_arange.size(0) < P:
+                self._cached_arange = torch.arange(
+                    P, dtype=torch.int32, device=hidden_states.device
+                )
+            inv_permuted_idx = self._cached_arange[:P]
+        else:
+            # Contiguous mode: invert sorted_token_ids.
+            if self._cached_arange is None or self._cached_arange.size(0) < num_slots:
+                self._cached_arange = torch.arange(
+                    num_slots, dtype=torch.int32, device=hidden_states.device
+                )
+            aligned_arange = self._cached_arange[:num_slots]
 
-        if (
-            self._cached_inv_perm_buf is None
-            or self._cached_inv_perm_buf.size(0) < P + 1
-        ):
-            self._cached_inv_perm_buf = torch.empty(
-                P + 1, dtype=torch.int32, device=hidden_states.device
+            if (
+                self._cached_inv_perm_buf is None
+                or self._cached_inv_perm_buf.size(0) < P + 1
+            ):
+                self._cached_inv_perm_buf = torch.empty(
+                    P + 1, dtype=torch.int32, device=hidden_states.device
+                )
+            inv_perm_buf = self._cached_inv_perm_buf[: P + 1]
+            inv_perm_buf.scatter_(
+                0, sorted_token_ids.clamp(max=P).long(), aligned_arange
             )
-        inv_perm_buf = self._cached_inv_perm_buf[: P + 1]
-        inv_perm_buf.scatter_(0, sorted_token_ids.clamp(max=P).long(), aligned_arange)
-        inv_permuted_idx = inv_perm_buf[:P]
+            inv_permuted_idx = inv_perm_buf[:P]
 
         unpermute_weights = topk_weights
         if apply_router_weight_on_input:

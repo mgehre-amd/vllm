@@ -1134,20 +1134,33 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_wvSplitK_int4_hf_sml_(
     const int K, const int M, const uint8_t* B_packed_base,
     const scalar_t* __restrict__ A_base, const scalar_t* scale_base,
     const scalar_t* zero_points_base, scalar_t* C_base,
-    const int* __restrict__ expert_ids, const long expert_stride_w,
-    const long expert_stride_s, const long expert_stride_zp, const int _WvPrGrp,
-    const int CuCount) {
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ sorted_token_ids, const int top_k,
+    const long expert_stride_w, const long expert_stride_s,
+    const long expert_stride_zp, const int _WvPrGrp, const int CuCount) {
   int expert_id = expert_ids[blockIdx.y];
   if (expert_id == -1) return;
 
-  long base_row = (long)blockIdx.y * N;
   const uint8_t* B = B_packed_base + expert_id * expert_stride_w;
-  const scalar_t* A = A_base + base_row * K;
   const scalar_t* S = scale_base + expert_id * expert_stride_s;
   const scalar_t* ZP = HAS_ZERO_POINTS
                            ? (zero_points_base + expert_id * expert_stride_zp)
                            : nullptr;
-  scalar_t* C = C_base + base_row * M;
+
+  // Scattered mode: use sorted_token_ids to index into unpermuted activations
+  // and write output at slot positions.
+  // Contiguous mode (sorted_token_ids==nullptr): pre-permuted layout.
+  const scalar_t* A;
+  scalar_t* C;
+  if (sorted_token_ids) {
+    int slot_id = sorted_token_ids[blockIdx.y * N];
+    A = A_base + (long)(slot_id / top_k) * K;
+    C = C_base + (long)slot_id * M;
+  } else {
+    long base_row = (long)blockIdx.y * N;
+    A = A_base + base_row * K;
+    C = C_base + base_row * M;
+  }
 
   wvSplitK_int4_compute_sml_<scalar_t, THRDS, YTILE, WvPrGrp, A_CHUNK, UNRL, N,
                              GROUP_SIZE, HAS_ZERO_POINTS, MOE_LDS_ELEMS>(
@@ -1160,20 +1173,30 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_wvSplitK_int4_hf_(
     const int K, const int M, const uint8_t* B_packed_base,
     const scalar_t* __restrict__ A_base, const scalar_t* scale_base,
     const scalar_t* zero_points_base, scalar_t* C_base,
-    const int* __restrict__ expert_ids, const long expert_stride_w,
-    const long expert_stride_s, const long expert_stride_zp, const int _WvPrGrp,
-    const int CuCount) {
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ sorted_token_ids, const int top_k,
+    const long expert_stride_w, const long expert_stride_s,
+    const long expert_stride_zp, const int _WvPrGrp, const int CuCount) {
   int expert_id = expert_ids[blockIdx.y];
   if (expert_id == -1) return;
 
-  long base_row = (long)blockIdx.y * N;
   const uint8_t* B = B_packed_base + expert_id * expert_stride_w;
-  const scalar_t* A = A_base + base_row * K;
   const scalar_t* S = scale_base + expert_id * expert_stride_s;
   const scalar_t* ZP = HAS_ZERO_POINTS
                            ? (zero_points_base + expert_id * expert_stride_zp)
                            : nullptr;
-  scalar_t* C = C_base + base_row * M;
+
+  const scalar_t* A;
+  scalar_t* C;
+  if (sorted_token_ids) {
+    int slot_id = sorted_token_ids[blockIdx.y * N];
+    A = A_base + (long)(slot_id / top_k) * K;
+    C = C_base + (long)slot_id * M;
+  } else {
+    long base_row = (long)blockIdx.y * N;
+    A = A_base + base_row * K;
+    C = C_base + base_row * M;
+  }
 
   wvSplitK_int4_compute_<scalar_t, THRDS, YTILE, WvPrGrp, A_CHUNK, UNRL, N,
                          GROUP_SIZE, HAS_ZERO_POINTS>(
@@ -1186,9 +1209,10 @@ __global__ void moe_wvSplitK_int4_hf_sml_(
     const int K, const int M, const uint8_t* B_packed_base,
     const scalar_t* __restrict__ A_base, const scalar_t* scale_base,
     const scalar_t* zero_points_base, scalar_t* C_base,
-    const int* __restrict__ expert_ids, const long expert_stride_w,
-    const long expert_stride_s, const long expert_stride_zp, const int _WvPrGrp,
-    const int CuCount) {
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ sorted_token_ids, const int top_k,
+    const long expert_stride_w, const long expert_stride_s,
+    const long expert_stride_zp, const int _WvPrGrp, const int CuCount) {
   UNREACHABLE_CODE
 }
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
@@ -1197,15 +1221,17 @@ __global__ void moe_wvSplitK_int4_hf_(
     const int K, const int M, const uint8_t* B_packed_base,
     const scalar_t* __restrict__ A_base, const scalar_t* scale_base,
     const scalar_t* zero_points_base, scalar_t* C_base,
-    const int* __restrict__ expert_ids, const long expert_stride_w,
-    const long expert_stride_s, const long expert_stride_zp, const int _WvPrGrp,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ sorted_token_ids, const int top_k,
+    const long expert_stride_w, const long expert_stride_s,
+    const long expert_stride_zp, const int _WvPrGrp,
     const int CuCount){UNREACHABLE_CODE}
 #endif  // defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 
 // MoE dispatch macros for fused_moe_wvSplitK_int4_gemm.
 // Required variables: M_in, K_in, CuCount, group_size, num_expert_blocks,
-//   wptr, aptr, sptr, zpptr, cptr, eidptr, expert_stride_w,
-//   expert_stride_s, expert_stride_zp, stream, max_lds_len
+//   wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr, top_k_in,
+//   expert_stride_w, expert_stride_s, expert_stride_zp, stream, max_lds_len
 // Required type: fptype, N_in (template constant via switch)
 
 #define MOE_WVSPLITK_INT4G_LAUNCH(_THRDS, _YTILE, _UNRL, _N, _GS, _HAS_ZP)    \
@@ -1221,13 +1247,15 @@ __global__ void moe_wvSplitK_int4_hf_(
     if (K_in * _N <= MOE_LDS_ELEMS && M_in % _YTILE == 0)                     \
       moe_wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, 16, 16, _UNRL, _N,    \
                                 _GS, _HAS_ZP><<<grid, block, 0, stream>>>(    \
-          K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, expert_stride_w, \
-          expert_stride_s, expert_stride_zp, __wvPrGrp, moe_cu);              \
+          K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr,         \
+          top_k_in, expert_stride_w, expert_stride_s, expert_stride_zp,       \
+          __wvPrGrp, moe_cu);                                                 \
     else                                                                      \
       moe_wvSplitK_int4_hf_<fptype, _THRDS, _YTILE, 16, 16, _UNRL, _N, _GS,   \
                             _HAS_ZP><<<grid, block, 0, stream>>>(             \
-          K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, expert_stride_w, \
-          expert_stride_s, expert_stride_zp, __wvPrGrp, moe_cu);              \
+          K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr,         \
+          top_k_in, expert_stride_w, expert_stride_s, expert_stride_zp,       \
+          __wvPrGrp, moe_cu);                                                 \
   }
 
 #define MOE_WVSPLITK_INT4G(_YTILE, _UNRL, _N, _GS, _HAS_ZP)        \
@@ -1394,8 +1422,9 @@ void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
                                   torch::Tensor scales, torch::Tensor c,
                                   torch::Tensor expert_ids,
                                   int64_t block_size_m, int64_t CuCount,
-                                  int64_t group_size,
-                                  torch::Tensor zero_points) {
+                                  int64_t group_size, torch::Tensor zero_points,
+                                  torch::Tensor sorted_token_ids,
+                                  int64_t top_k) {
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -1414,6 +1443,11 @@ void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
 
   const int max_lds_len = get_lds_size_int4() / 2;
 
+  // Scattered mode: sorted_token_ids is non-empty, kernel indexes into
+  // unpermuted activations via sorted_token_ids[block] / top_k.
+  bool scattered = sorted_token_ids.numel() > 0;
+  int top_k_in = scattered ? static_cast<int>(top_k) : 1;
+
   // No c.zero_() needed: the wvSplitK kernel writes all M output rows directly
   // (no atomicAdd), and padding blocks with expert_id==-1 are never read by
   // the caller (moe_unpermute only accesses valid token slots).
@@ -1430,6 +1464,8 @@ void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
                    : nullptr;
         fptype* cptr = reinterpret_cast<fptype*>(c.data_ptr());
         const int* eidptr = expert_ids.data_ptr<int32_t>();
+        const int* stidptr =
+            scattered ? sorted_token_ids.data_ptr<int32_t>() : nullptr;
 
         // Single kernel launch: grid.y = num_expert_blocks
         if (has_zp)
