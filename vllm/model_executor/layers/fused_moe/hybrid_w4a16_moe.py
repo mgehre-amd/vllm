@@ -3,10 +3,9 @@
 """Hybrid W4A16 MoE experts using fused wvSplitK_int4_g kernel.
 
 Weights are stored in skinny layout [E, N, K//8] int32 (ExLlama shuffle
-packed).  The fused C++ kernel iterates expert runs internally, avoiding
-Python loop overhead.
-
-NOTE: This kernel is NOT CUDA-graph compatible. Use with --enforce-eager.
+packed).  The fused on-device kernel dispatches expert blocks via
+blockIdx.y, avoiding host-side loops and GPU→CPU synchronization.
+CUDA-graph compatible.
 """
 
 import torch
