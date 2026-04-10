@@ -61,6 +61,9 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
         from vllm.utils.platform_utils import num_compute_units
 
         self._cu_count = num_compute_units()
+        # Cached tensors to avoid repeated allocation in hot path
+        self._cached_arange: torch.Tensor | None = None
+        self._cached_inv_perm_buf: torch.Tensor | None = None
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -244,12 +247,21 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
         # ---- Reduce via moe_unpermute ----
         # Output is always in sorted (expert-contiguous) order, so we
         # always need to invert sorted_token_ids to recover slot order.
-        inv_perm_buf = torch.empty(
-            P + 1, dtype=torch.int32, device=hidden_states.device
-        )
-        aligned_arange = torch.arange(
-            num_slots, dtype=torch.int32, device=hidden_states.device
-        )
+        # Cache the arange and inv_perm_buf to avoid re-allocation.
+        if self._cached_arange is None or self._cached_arange.size(0) < num_slots:
+            self._cached_arange = torch.arange(
+                num_slots, dtype=torch.int32, device=hidden_states.device
+            )
+        aligned_arange = self._cached_arange[:num_slots]
+
+        if (
+            self._cached_inv_perm_buf is None
+            or self._cached_inv_perm_buf.size(0) < P + 1
+        ):
+            self._cached_inv_perm_buf = torch.empty(
+                P + 1, dtype=torch.int32, device=hidden_states.device
+            )
+        inv_perm_buf = self._cached_inv_perm_buf[: P + 1]
         inv_perm_buf.scatter_(0, sorted_token_ids.clamp(max=P).long(), aligned_arange)
         inv_permuted_idx = inv_perm_buf[:P]
 
