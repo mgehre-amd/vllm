@@ -201,42 +201,48 @@ __global__ void LLGemm1_kernel(const scalar_t* in_a, const scalar_t* in_b,
   scalar2_t acch2;
   scalar2_t oval;
 
-  // As we later use warp shuffle operations, we may have more threads in the
-  // block than the actual available data, hence the if guard here.
-  if (threadid * 8 < K) {
-#pragma unroll
-    for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++) {
-      // rowA_elem4[i] holds 8 * half numbers seen as a single float4.
-      rowA_elem4[i] = load_ntmprl(&af4[row_addr + threadid + K / 8 * i]);
-    }
-    colB_elem4x = bf4[threadid * 4 + 0];
-    colB_elem4y = bf4[threadid * 4 + 1];
-    colB_elem4z = bf4[threadid * 4 + 2];
-    colB_elem4w = bf4[threadid * 4 + 3];
-  }
-
-  scalar2_t Af2;
-  float2 S;
-
-  auto Ah2ptr = reinterpret_cast<scalar2_t*>(&rowA_elem4);
-  scalar2_t* ah2lptr;
+  // Each thread processes 8 elements per iteration. With NUM_THREADS threads,
+  // each iteration covers NUM_THREADS * 8 elements of K. Loop over chunks
+  // to handle K values larger than NUM_THREADS * 8.
+  const int elems_per_iter = blockDim.x;  // threads, each handling 8 elements
+  const int K_div8 = K / 8;
 
 #pragma unroll
   for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++) {
-    // Multiply-add on 8 scalar_t.
-    ah2lptr = Ah2ptr + i * 4;
-    Af2 = *(ah2lptr);
-    acch2 = __hmul2(Af2, colB_elem4x);
-    Af2 = *(ah2lptr + 1);
-    acch2 = __hfma2(Af2, colB_elem4y, acch2);
-    Af2 = *(ah2lptr + 2);
-    acch2 = __hfma2(Af2, colB_elem4z, acch2);
-    Af2 = *(ah2lptr + 3);
-    acch2 = __hfma2(Af2, colB_elem4w, acch2);
-    S = __s22float2(acch2);
+    acc[i] = 0.f;
+  }
 
-    // See comment above concerning the if guard.
-    acc[i] = (threadid * 8 < K ? S.x + S.y : 0.f);
+  for (int base = 0; base < K_div8; base += elems_per_iter) {
+    int idx = base + threadid;
+    if (idx < K_div8) {
+#pragma unroll
+      for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++) {
+        rowA_elem4[i] = load_ntmprl(&af4[row_addr + idx + K_div8 * i]);
+      }
+      colB_elem4x = bf4[idx * 4 + 0];
+      colB_elem4y = bf4[idx * 4 + 1];
+      colB_elem4z = bf4[idx * 4 + 2];
+      colB_elem4w = bf4[idx * 4 + 3];
+
+      scalar2_t Af2;
+      auto Ah2ptr = reinterpret_cast<scalar2_t*>(&rowA_elem4);
+      scalar2_t* ah2lptr;
+
+#pragma unroll
+      for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++) {
+        ah2lptr = Ah2ptr + i * 4;
+        Af2 = *(ah2lptr);
+        acch2 = __hmul2(Af2, colB_elem4x);
+        Af2 = *(ah2lptr + 1);
+        acch2 = __hfma2(Af2, colB_elem4y, acch2);
+        Af2 = *(ah2lptr + 2);
+        acch2 = __hfma2(Af2, colB_elem4z, acch2);
+        Af2 = *(ah2lptr + 3);
+        acch2 = __hfma2(Af2, colB_elem4w, acch2);
+        float2 S = __s22float2(acch2);
+        acc[i] += S.x + S.y;
+      }
+    }
   }
 
 // all reduce across warp.
@@ -285,13 +291,15 @@ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
   auto out_c = torch::empty(
       {N, M}, torch::TensorOptions().dtype(in_b.dtype()).device(in_b.device()));
 
-  // NUM_TREADS need to be a multiple of WARP_SIZE, as we are using warp shuffle
-  // operations.
-  const int NUM_THREADS =
+  // NUM_THREADS must be a multiple of WARP_SIZE (warp shuffle operations).
+  // Cap at 512 (16 warps) because the cross-warp reduction uses 16 threads
+  // per row. The kernel loops over K in chunks when K/8 > NUM_THREADS.
+  int NUM_THREADS =
       max(rows_per_block * 16,
           K * 2 / 16 % WARP_SIZE == 0
               ? K * 2 / 16
               : K * 2 / 16 + (WARP_SIZE - K * 2 / 16 % WARP_SIZE));
+  NUM_THREADS = min(NUM_THREADS, 512);
 
   int NUM_BLOCKS = M / rows_per_block;
 
