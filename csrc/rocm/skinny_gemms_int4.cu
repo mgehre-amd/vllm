@@ -1139,19 +1139,24 @@ __global__ void moe_wvSplitK_int4_hf_(
 
 #define MOE_WVSPLITK_INT4G_LAUNCH(_THRDS, _YTILE, _UNRL, _N, _GS, _HAS_ZP)    \
   {                                                                           \
+    /* For MoE, use fewer CUs per expert block to increase inter-expert       \
+       parallelism.  With block_size_m=2, the M dimension per expert block is \
+       small, so fewer CUs can cover it with more M-loop iterations while     \
+       allowing the GPU scheduler to run more expert blocks concurrently. */  \
+    int moe_cu = max(CuCount / 8, 2);                                         \
     dim3 block(_THRDS, 16);                                                   \
-    int __wvPrGrp = mindiv_int4(M_in, CuCount * _YTILE, 16);                  \
-    dim3 grid(CuCount, num_expert_blocks);                                    \
+    int __wvPrGrp = mindiv_int4(M_in, moe_cu * _YTILE, 16);                   \
+    dim3 grid(moe_cu, num_expert_blocks);                                     \
     if (K_in * _N <= max_lds_len && M_in % _YTILE == 0)                       \
       moe_wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, 16, 16, _UNRL, _N,    \
                                 _GS, _HAS_ZP><<<grid, block, 0, stream>>>(    \
           K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, expert_stride_w, \
-          expert_stride_s, expert_stride_zp, __wvPrGrp, CuCount);             \
+          expert_stride_s, expert_stride_zp, __wvPrGrp, moe_cu);              \
     else                                                                      \
       moe_wvSplitK_int4_hf_<fptype, _THRDS, _YTILE, 16, 16, _UNRL, _N, _GS,   \
                             _HAS_ZP><<<grid, block, 0, stream>>>(             \
           K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, expert_stride_w, \
-          expert_stride_s, expert_stride_zp, __wvPrGrp, CuCount);             \
+          expert_stride_s, expert_stride_zp, __wvPrGrp, moe_cu);              \
   }
 
 #define MOE_WVSPLITK_INT4G(_YTILE, _UNRL, _N, _GS, _HAS_ZP)        \
