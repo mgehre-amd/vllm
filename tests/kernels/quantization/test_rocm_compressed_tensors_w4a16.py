@@ -10,8 +10,15 @@ Run `pytest tests/kernels/quantization/test_rocm_compressed_tensors_w4a16.py`.
 """
 
 import pytest
+import torch.nn as nn
 
 from vllm.platforms import current_platform
+
+
+def _check_kernel_type(model: nn.Module) -> str:
+    """Return the kernel class name for the first linear layer."""
+    first_linear = model.model.layers[0].self_attn.qkv_proj
+    return type(first_linear.kernel).__name__
 
 
 @pytest.mark.parametrize(
@@ -24,15 +31,19 @@ from vllm.platforms import current_platform
 @pytest.mark.parametrize("max_tokens", [32])
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="Should only run on ROCm")
 def test_rocm_compressed_tensors_w4a16_e2e(
-    vllm_runner, example_prompts, model_path, max_tokens
+    vllm_runner, example_prompts, model_path, max_tokens, enable_pickle
 ):
     # Use fp16 activations for maximum compatibility.
     # gpu_memory_utilization lowered to work on shared nodes.
     with vllm_runner(
         model_path, dtype="float16", gpu_memory_utilization=0.3
     ) as vllm_model:
-        # Note: we cannot assert HybridW4A16LinearKernel is selected here
-        # because V1 engine runs the model in a subprocess and apply_model
-        # requires serializable callables (msgpack can't serialize functions).
-        # If the W4A16 kernel is broken, generate_greedy will throw.
         vllm_model.generate_greedy(example_prompts, max_tokens=max_tokens)
+
+        # Verify HybridW4A16LinearKernel was selected (not a silent fallback).
+        # enable_pickle is needed because V1 multiproc executor serializes
+        # apply_model args via msgpack, which can't handle functions by default.
+        kernel_names = vllm_model.apply_model(_check_kernel_type)
+        assert kernel_names[0] == "HybridW4A16LinearKernel", (
+            f"Expected HybridW4A16LinearKernel, got {kernel_names[0]}"
+        )
