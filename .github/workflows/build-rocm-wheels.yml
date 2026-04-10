@@ -1,4 +1,4 @@
-name: Build ROCm Wheels
+name: Build gfx115X prototype wheels
 
 on:
   push:

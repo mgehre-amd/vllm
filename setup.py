@@ -924,7 +924,7 @@ def get_vllm_version() -> str:
 
     # Add fork identifier to distinguish from upstream builds
     sep = "." if "+" in version else "+"
-    version += f"{sep}mgehre"
+    version += f"{sep}gfx115x.prototype"
 
     return version
 
