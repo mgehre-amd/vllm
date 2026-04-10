@@ -1343,7 +1343,9 @@ void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
 
   const int max_lds_len = get_lds_size_int4() / 2;
 
-  c.zero_();
+  // No c.zero_() needed: the wvSplitK kernel writes all M output rows directly
+  // (no atomicAdd), and padding blocks with expert_id==-1 are never read by
+  // the caller (moe_unpermute only accesses valid token slots).
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(
       a.scalar_type(), "fused_moe_wvSplitK_int4_gemm", [&] {
