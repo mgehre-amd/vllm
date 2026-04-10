@@ -657,9 +657,10 @@ class RocmPlatform(Platform):
         use_aiter_rms_norm = rocm_aiter_ops.is_rmsnorm_enabled()
         use_aiter_fp8_linear = rocm_aiter_ops.is_linear_fp8_enabled()
         use_aiter_fused_se = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-        #  Aiter rms norm perform best when CUDA Graph capture is enabled.
+        # The fused rms_norm custom op is beneficial on gfx11 even
+        # without aiter, and on other architectures when aiter is available.
         if (
-            use_aiter_rms_norm
+            (use_aiter_rms_norm or _ON_GFX11)
             and not is_eager_execution
             and "-rms_norm" not in compilation_config.custom_ops
         ):
