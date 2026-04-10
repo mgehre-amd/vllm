@@ -260,51 +260,83 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
                     __hfma2(*(half2*)&hi1, *(const half2*)&SCALE16,
                             *(const half2*)&BIAS_HI);
               }
+
+              if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
+                uint32_t group_idx = k_ / GROUP_SIZE;
+                scalar_t zp = zero_points[(m + y) * num_groups + group_idx];
+  #pragma unroll
+                for (uint32_t b = 0; b < A_CHUNK; b++) {
+                  cvtB.h[b] = cvtB.h[b] - zp;
+                }
+              }
+
+              if constexpr (GROUP_SIZE > 0) {
+                float partial = 0;
+  #pragma unroll
+                for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                  DOT2C(partial, bigA[n][k2].f[b], cvtB.f[b])
+                }
+                uint32_t group_idx = k_ / GROUP_SIZE;
+                sum[n][y] += partial *
+                             __s2float(scale[(m + y) * num_groups + group_idx]);
+              } else {
+  #pragma unroll
+                for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                  DOT2C(sum[n][y], bigA[n][k2].f[b], cvtB.f[b])
+                }
+              }
             } else {
-              constexpr int ZP_BIAS = HAS_ZERO_POINTS ? 0 : 8;
+              // BF16 path: dequant int4 → f32 directly and accumulate
+              // in f32, bypassing expensive bf16 intermediate conversion.
+              // Per-element: v_bfe+v_cvt_f32+v_fmac vs 10.5 ops (2.5x fewer).
+              constexpr float ZP_F = HAS_ZERO_POINTS ? 0.0f : 8.0f;
   #pragma unroll
               for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
                 uint32_t qa = bigB[y][k2].u32[w];
-                cvtB.h[w * 8 + 0] = (scalar_t)((int)(qa & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 1] =
-                    (scalar_t)((int)((qa >> 16) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 2] =
-                    (scalar_t)((int)((qa >> 4) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 3] =
-                    (scalar_t)((int)((qa >> 20) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 4] =
-                    (scalar_t)((int)((qa >> 8) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 5] =
-                    (scalar_t)((int)((qa >> 24) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 6] =
-                    (scalar_t)((int)((qa >> 12) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 7] =
-                    (scalar_t)((int)((qa >> 28) & 0xF) - ZP_BIAS);
-              }
-            }
+                // Dequant 8 nibbles to f32 (ExLlama shuffle order)
+                float w0 = (float)(int)(qa & 0xF) - ZP_F;
+                float w1 = (float)(int)((qa >> 16) & 0xF) - ZP_F;
+                float w2 = (float)(int)((qa >> 4) & 0xF) - ZP_F;
+                float w3 = (float)(int)((qa >> 20) & 0xF) - ZP_F;
+                float w4 = (float)(int)((qa >> 8) & 0xF) - ZP_F;
+                float w5 = (float)(int)((qa >> 24) & 0xF) - ZP_F;
+                float w6 = (float)(int)((qa >> 12) & 0xF) - ZP_F;
+                float w7 = (float)(int)((qa >> 28) & 0xF) - ZP_F;
 
-            if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
-              uint32_t group_idx = k_ / GROUP_SIZE;
-              scalar_t zp = zero_points[(m + y) * num_groups + group_idx];
-  #pragma unroll
-              for (uint32_t b = 0; b < A_CHUNK; b++) {
-                cvtB.h[b] = cvtB.h[b] - zp;
-              }
-            }
+                if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
+                  uint32_t group_idx = k_ / GROUP_SIZE;
+                  float zp =
+                      __s2float(zero_points[(m + y) * num_groups + group_idx]);
+                  w0 -= zp;
+                  w1 -= zp;
+                  w2 -= zp;
+                  w3 -= zp;
+                  w4 -= zp;
+                  w5 -= zp;
+                  w6 -= zp;
+                  w7 -= zp;
+                }
 
-            if constexpr (GROUP_SIZE > 0) {
-              float partial = 0;
-  #pragma unroll
-              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-                DOT2C(partial, bigA[n][k2].f[b], cvtB.f[b])
-              }
-              uint32_t group_idx = k_ / GROUP_SIZE;
-              sum[n][y] +=
-                  partial * __s2float(scale[(m + y) * num_groups + group_idx]);
-            } else {
-  #pragma unroll
-              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-                DOT2C(sum[n][y], bigA[n][k2].f[b], cvtB.f[b])
+                // Convert activations bf16 → f32 and dot-product
+                float a0 = __s2float(bigA[n][k2].h[w * 8 + 0]);
+                float a1 = __s2float(bigA[n][k2].h[w * 8 + 1]);
+                float a2 = __s2float(bigA[n][k2].h[w * 8 + 2]);
+                float a3 = __s2float(bigA[n][k2].h[w * 8 + 3]);
+                float a4 = __s2float(bigA[n][k2].h[w * 8 + 4]);
+                float a5 = __s2float(bigA[n][k2].h[w * 8 + 5]);
+                float a6 = __s2float(bigA[n][k2].h[w * 8 + 6]);
+                float a7 = __s2float(bigA[n][k2].h[w * 8 + 7]);
+
+                float dot = w0 * a0 + w1 * a1 + w2 * a2 + w3 * a3 + w4 * a4 +
+                            w5 * a5 + w6 * a6 + w7 * a7;
+
+                if constexpr (GROUP_SIZE > 0) {
+                  uint32_t group_idx = k_ / GROUP_SIZE;
+                  sum[n][y] +=
+                      dot * __s2float(scale[(m + y) * num_groups + group_idx]);
+                } else {
+                  sum[n][y] += dot;
+                }
               }
             }
           }
@@ -537,51 +569,83 @@ __device__ __forceinline__ void wvSplitK_int4_compute_(
                     __hfma2(*(half2*)&hi1, *(const half2*)&SCALE16,
                             *(const half2*)&BIAS_HI);
               }
+
+              if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
+                uint32_t group_idx = k_ / GROUP_SIZE;
+                scalar_t zp = zero_points[(m + y) * num_groups + group_idx];
+  #pragma unroll
+                for (uint32_t b = 0; b < A_CHUNK; b++) {
+                  cvtB.h[b] = cvtB.h[b] - zp;
+                }
+              }
+
+              if constexpr (GROUP_SIZE > 0) {
+                float partial = 0;
+  #pragma unroll
+                for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                  DOT2C(partial, bigA[n][k2].f[b], cvtB.f[b])
+                }
+                uint32_t group_idx = k_ / GROUP_SIZE;
+                sum[n][y] += partial *
+                             __s2float(scale[(m + y) * num_groups + group_idx]);
+              } else {
+  #pragma unroll
+                for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                  DOT2C(sum[n][y], bigA[n][k2].f[b], cvtB.f[b])
+                }
+              }
             } else {
-              constexpr int ZP_BIAS = HAS_ZERO_POINTS ? 0 : 8;
+              // BF16 path: dequant int4 → f32 directly and accumulate
+              // in f32, bypassing expensive bf16 intermediate conversion.
+              // Per-element: v_bfe+v_cvt_f32+v_fmac vs 10.5 ops (2.5x fewer).
+              constexpr float ZP_F = HAS_ZERO_POINTS ? 0.0f : 8.0f;
   #pragma unroll
               for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
                 uint32_t qa = bigB[y][k2].u32[w];
-                cvtB.h[w * 8 + 0] = (scalar_t)((int)(qa & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 1] =
-                    (scalar_t)((int)((qa >> 16) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 2] =
-                    (scalar_t)((int)((qa >> 4) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 3] =
-                    (scalar_t)((int)((qa >> 20) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 4] =
-                    (scalar_t)((int)((qa >> 8) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 5] =
-                    (scalar_t)((int)((qa >> 24) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 6] =
-                    (scalar_t)((int)((qa >> 12) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 7] =
-                    (scalar_t)((int)((qa >> 28) & 0xF) - ZP_BIAS);
-              }
-            }
+                // Dequant 8 nibbles to f32 (ExLlama shuffle order)
+                float w0 = (float)(int)(qa & 0xF) - ZP_F;
+                float w1 = (float)(int)((qa >> 16) & 0xF) - ZP_F;
+                float w2 = (float)(int)((qa >> 4) & 0xF) - ZP_F;
+                float w3 = (float)(int)((qa >> 20) & 0xF) - ZP_F;
+                float w4 = (float)(int)((qa >> 8) & 0xF) - ZP_F;
+                float w5 = (float)(int)((qa >> 24) & 0xF) - ZP_F;
+                float w6 = (float)(int)((qa >> 12) & 0xF) - ZP_F;
+                float w7 = (float)(int)((qa >> 28) & 0xF) - ZP_F;
 
-            if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
-              uint32_t group_idx = k_ / GROUP_SIZE;
-              scalar_t zp = zero_points[(m + y) * num_groups + group_idx];
-  #pragma unroll
-              for (uint32_t b = 0; b < A_CHUNK; b++) {
-                cvtB.h[b] = cvtB.h[b] - zp;
-              }
-            }
+                if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
+                  uint32_t group_idx = k_ / GROUP_SIZE;
+                  float zp =
+                      __s2float(zero_points[(m + y) * num_groups + group_idx]);
+                  w0 -= zp;
+                  w1 -= zp;
+                  w2 -= zp;
+                  w3 -= zp;
+                  w4 -= zp;
+                  w5 -= zp;
+                  w6 -= zp;
+                  w7 -= zp;
+                }
 
-            if constexpr (GROUP_SIZE > 0) {
-              float partial = 0;
-  #pragma unroll
-              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-                DOT2C(partial, bigA[n][k2].f[b], cvtB.f[b])
-              }
-              uint32_t group_idx = k_ / GROUP_SIZE;
-              sum[n][y] +=
-                  partial * __s2float(scale[(m + y) * num_groups + group_idx]);
-            } else {
-  #pragma unroll
-              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-                DOT2C(sum[n][y], bigA[n][k2].f[b], cvtB.f[b])
+                // Convert activations bf16 → f32 and dot-product
+                float a0 = __s2float(bigA[n][k2].h[w * 8 + 0]);
+                float a1 = __s2float(bigA[n][k2].h[w * 8 + 1]);
+                float a2 = __s2float(bigA[n][k2].h[w * 8 + 2]);
+                float a3 = __s2float(bigA[n][k2].h[w * 8 + 3]);
+                float a4 = __s2float(bigA[n][k2].h[w * 8 + 4]);
+                float a5 = __s2float(bigA[n][k2].h[w * 8 + 5]);
+                float a6 = __s2float(bigA[n][k2].h[w * 8 + 6]);
+                float a7 = __s2float(bigA[n][k2].h[w * 8 + 7]);
+
+                float dot = w0 * a0 + w1 * a1 + w2 * a2 + w3 * a3 + w4 * a4 +
+                            w5 * a5 + w6 * a6 + w7 * a7;
+
+                if constexpr (GROUP_SIZE > 0) {
+                  uint32_t group_idx = k_ / GROUP_SIZE;
+                  sum[n][y] +=
+                      dot * __s2float(scale[(m + y) * num_groups + group_idx]);
+                } else {
+                  sum[n][y] += dot;
+                }
               }
             }
           }
