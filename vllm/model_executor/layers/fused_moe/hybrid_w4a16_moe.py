@@ -63,6 +63,7 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
         # Cached tensors to avoid repeated allocation in hot path
         self._cached_arange: torch.Tensor | None = None
         self._cached_inv_perm_buf: torch.Tensor | None = None
+        self._cached_expert_ids_buf: torch.Tensor | None = None
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -193,25 +194,50 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
             num_tokens, top_k_num, global_num_experts
         )
 
-        # ---- Route tokens to experts ----
-        sorted_token_ids, expert_ids, _ = moe_align_block_size(
-            topk_ids,
-            block_size_m,
-            global_num_experts,
-            expert_map,
-            ignore_invalid_experts=True,
-        )
-
-        num_slots = sorted_token_ids.size(0)
         P = num_tokens * top_k_num
 
-        # For block_size_m=1 (decode), skip pre-permutation: the kernel
-        # indexes into unpermuted activations via sorted_token_ids.
-        # For block_size_m>1 (prefill), pre-permute into contiguous blocks.
+        # ---- Route tokens to experts ----
+        # For decode (num_tokens=1, block_size_m=1) without expert parallelism,
+        # skip moe_align_block_size entirely. The kernel processes each expert
+        # block independently via blockIdx.y, so no sorting is needed — just
+        # pass topk_ids directly as expert_ids and arange as sorted_token_ids.
         scattered = block_size_m == 1
-        if scattered:
+        if scattered and expert_map is None:
+            if (
+                self._cached_expert_ids_buf is None
+                or self._cached_expert_ids_buf.size(0) < P
+            ):
+                self._cached_expert_ids_buf = torch.empty(
+                    P, dtype=torch.int32, device=hidden_states.device
+                )
+            expert_ids = self._cached_expert_ids_buf[:P]
+            expert_ids.copy_(topk_ids.view(-1))
+            if self._cached_arange is None or self._cached_arange.size(0) < P:
+                self._cached_arange = torch.arange(
+                    P, dtype=torch.int32, device=hidden_states.device
+                )
+            sorted_token_ids = self._cached_arange[:P]
+            num_slots = P
+            gemm1_in = hidden_states
+        elif scattered:
+            sorted_token_ids, expert_ids, _ = moe_align_block_size(
+                topk_ids,
+                block_size_m,
+                global_num_experts,
+                expert_map,
+                ignore_invalid_experts=True,
+            )
+            num_slots = sorted_token_ids.size(0)
             gemm1_in = hidden_states
         else:
+            sorted_token_ids, expert_ids, _ = moe_align_block_size(
+                topk_ids,
+                block_size_m,
+                global_num_experts,
+                expert_map,
+                ignore_invalid_experts=True,
+            )
+            num_slots = sorted_token_ids.size(0)
             source_rows = (sorted_token_ids // top_k_num).clamp(max=num_tokens - 1)
             gemm1_in = _resize_cache(workspace13, (num_slots, K))
             torch.index_select(hidden_states, 0, source_rows.long(), out=gemm1_in)
