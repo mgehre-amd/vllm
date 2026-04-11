@@ -1337,8 +1337,8 @@ __global__ void moe_wvSplitK_int4_hf_(
       MOE_WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                        \
     else if (__N >= 2)                                                \
       MOE_WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                        \
-    else                                                              \
-      MOE_WVSPLIT_INT4G_GS(4, 2, __N, _HAS_ZP)                        \
+    else /* N=1: YTILE=2 beats YTILE=1 across all CuCount values */   \
+      MOE_WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                        \
   }
 
 #define MOE_WVSPLIT_INT4G_DISPATCH(_HAS_ZP)                \
