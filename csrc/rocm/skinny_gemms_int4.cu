@@ -1236,14 +1236,15 @@ __global__ void moe_wvSplitK_int4_hf_(
 
 #define MOE_WVSPLITK_INT4G_LAUNCH(_THRDS, _YTILE, _UNRL, _N, _GS, _HAS_ZP)  \
   {                                                                         \
-    /* For MoE decode, use CuCount/2 CUs per expert block. Sweep results    \
-       (Strix Halo 40 CUs, 8 active experts, Qwen3-30B-A3B w4a16):          \
-         CuCount/8=5  → 16.15ms  (too little per-expert bandwidth)        \
-         CuCount/4=10 → 13.74ms                                           \
-         CuCount/3=13 → 13.58ms                                           \
-         CuCount/2=20 → 13.41ms  (best: 2 experts concurrent)             \
-         CuCount=40   → 13.72ms  (too serialized) */                      \
-    int moe_cu = max(CuCount / 2, 2);                                       \
+    /* Use all CUs for each expert block (experts run sequentially).        \
+       Microbenchmark sweep (Strix Halo 20 CUs, 8 active experts,           \
+       Qwen3-30B-A3B w4a16, GEMM1 N=1 K=2048 M=1536):                       \
+         moe_cu= 5  → 61.1μs                                             \
+         moe_cu=10  → 61.6μs                                             \
+         moe_cu=15  → 60.4μs                                             \
+         moe_cu=20  → 57.9μs  (best: all CUs, serialized experts)        \
+         moe_cu=25  → 60.7μs  (oversubscription) */                      \
+    int moe_cu = CuCount;                                                   \
     dim3 block(_THRDS, 16);                                                 \
     int __wvPrGrp = mindiv_int4(M_in, moe_cu * _YTILE, 16);                 \
     dim3 grid(moe_cu, num_expert_blocks);                                   \
