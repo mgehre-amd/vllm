@@ -1090,10 +1090,8 @@ torch::Tensor wvSplitK_int4_sweep(const at::Tensor& in_a,
       WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                            \
     else if (__N >= 2)                                                \
       WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                            \
-    else if (_sYT >= 30)                                              \
+    else /* N=1: YTILE=2 beats YTILE=1 across all CuCount values */   \
       WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                            \
-    else                                                              \
-      WVSPLIT_INT4G_GS(1, 4, __N, _HAS_ZP)                            \
   }
 
 // Inner dispatch: shared by both symmetric and asymmetric paths
