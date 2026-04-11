@@ -287,56 +287,80 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
                 }
               }
             } else {
-              // BF16 path: dequant int4 → f32 directly and accumulate
-              // in f32, bypassing expensive bf16 intermediate conversion.
-              // Per-element: v_bfe+v_cvt_f32+v_fmac vs 10.5 ops (2.5x fewer).
-              constexpr float ZP_F = HAS_ZERO_POINTS ? 0.0f : 8.0f;
+              // BF16 path: dequant int4 → fp16 via bit manipulation
+              // (same as fp16 path), convert bf16 activations → fp16,
+              // then use native fdot2 for the dot product.
+              // This is ~2.5× fewer ALU ops than scalar bf16→f32 path.
+              constexpr uint32_t BF16_FP16_MAGIC = 0x64006400u;
+              constexpr uint32_t BF16_BIAS_LO =
+                  HAS_ZERO_POINTS ? 0x64006400u : 0x64086408u;
+              constexpr uint32_t BF16_SCALE16 = 0x2C002C00u;
+              constexpr uint32_t BF16_BIAS_HI =
+                  HAS_ZERO_POINTS ? 0xD400D400u : 0xD480D480u;
+
+              // Temporary fp16 storage for dequantized weights
+              half cvtW_h[A_CHUNK];
+
   #pragma unroll
               for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
                 uint32_t qa = bigB[y][k2].u32[w];
-                // Dequant 8 nibbles to f32 (ExLlama shuffle order)
-                float w0 = (float)(int)(qa & 0xF) - ZP_F;
-                float w1 = (float)(int)((qa >> 16) & 0xF) - ZP_F;
-                float w2 = (float)(int)((qa >> 4) & 0xF) - ZP_F;
-                float w3 = (float)(int)((qa >> 20) & 0xF) - ZP_F;
-                float w4 = (float)(int)((qa >> 8) & 0xF) - ZP_F;
-                float w5 = (float)(int)((qa >> 24) & 0xF) - ZP_F;
-                float w6 = (float)(int)((qa >> 12) & 0xF) - ZP_F;
-                float w7 = (float)(int)((qa >> 28) & 0xF) - ZP_F;
+                uint32_t lo0 = (qa & 0x000F000Fu) | BF16_FP16_MAGIC;
+                uint32_t hi0 = (qa & 0x00F000F0u) | BF16_FP16_MAGIC;
+                qa >>= 8;
+                uint32_t lo1 = (qa & 0x000F000Fu) | BF16_FP16_MAGIC;
+                uint32_t hi1 = (qa & 0x00F000F0u) | BF16_FP16_MAGIC;
 
-                if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
-                  uint32_t group_idx = k_ / GROUP_SIZE;
-                  float zp =
-                      __s2float(zero_points[(m + y) * num_groups + group_idx]);
-                  w0 -= zp;
-                  w1 -= zp;
-                  w2 -= zp;
-                  w3 -= zp;
-                  w4 -= zp;
-                  w5 -= zp;
-                  w6 -= zp;
-                  w7 -= zp;
+                *(half2*)&cvtW_h[w * 8 + 0] =
+                    __hsub2(*(half2*)&lo0, *(const half2*)&BF16_BIAS_LO);
+                *(half2*)&cvtW_h[w * 8 + 2] =
+                    __hfma2(*(half2*)&hi0, *(const half2*)&BF16_SCALE16,
+                            *(const half2*)&BF16_BIAS_HI);
+                *(half2*)&cvtW_h[w * 8 + 4] =
+                    __hsub2(*(half2*)&lo1, *(const half2*)&BF16_BIAS_LO);
+                *(half2*)&cvtW_h[w * 8 + 6] =
+                    __hfma2(*(half2*)&hi1, *(const half2*)&BF16_SCALE16,
+                            *(const half2*)&BF16_BIAS_HI);
+              }
+
+              if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
+                uint32_t group_idx = k_ / GROUP_SIZE;
+                float zp_f =
+                    __s2float(zero_points[(m + y) * num_groups + group_idx]);
+                half zp_h = __float2half(zp_f);
+  #pragma unroll
+                for (uint32_t b = 0; b < A_CHUNK; b++) {
+                  cvtW_h[b] = cvtW_h[b] - zp_h;
                 }
+              }
 
-                // Convert activations bf16 → f32 and dot-product
-                float a0 = __s2float(bigA[n][k2].h[w * 8 + 0]);
-                float a1 = __s2float(bigA[n][k2].h[w * 8 + 1]);
-                float a2 = __s2float(bigA[n][k2].h[w * 8 + 2]);
-                float a3 = __s2float(bigA[n][k2].h[w * 8 + 3]);
-                float a4 = __s2float(bigA[n][k2].h[w * 8 + 4]);
-                float a5 = __s2float(bigA[n][k2].h[w * 8 + 5]);
-                float a6 = __s2float(bigA[n][k2].h[w * 8 + 6]);
-                float a7 = __s2float(bigA[n][k2].h[w * 8 + 7]);
-
-                float dot = w0 * a0 + w1 * a1 + w2 * a2 + w3 * a3 + w4 * a4 +
-                            w5 * a5 + w6 * a6 + w7 * a7;
-
-                if constexpr (GROUP_SIZE > 0) {
-                  uint32_t group_idx = k_ / GROUP_SIZE;
-                  sum[n][y] +=
-                      dot * __s2float(scale[(m + y) * num_groups + group_idx]);
-                } else {
-                  sum[n][y] += dot;
+              // Convert bf16 activations to fp16 and dot product via fdot2
+              if constexpr (GROUP_SIZE > 0) {
+                float partial = 0;
+  #pragma unroll
+                for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                  half a_h0 =
+                      __float2half(__bfloat162float(bigA[n][k2].h[b * 2 + 0]));
+                  half a_h1 =
+                      __float2half(__bfloat162float(bigA[n][k2].h[b * 2 + 1]));
+                  half2 a_pair = {a_h0, a_h1};
+                  half2 w_pair = *(half2*)&cvtW_h[b * 2];
+                  partial =
+                      __builtin_amdgcn_fdot2(a_pair, w_pair, partial, false);
+                }
+                uint32_t group_idx = k_ / GROUP_SIZE;
+                sum[n][y] += partial *
+                             __s2float(scale[(m + y) * num_groups + group_idx]);
+              } else {
+  #pragma unroll
+                for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                  half a_h0 =
+                      __float2half(__bfloat162float(bigA[n][k2].h[b * 2 + 0]));
+                  half a_h1 =
+                      __float2half(__bfloat162float(bigA[n][k2].h[b * 2 + 1]));
+                  half2 a_pair = {a_h0, a_h1};
+                  half2 w_pair = *(half2*)&cvtW_h[b * 2];
+                  sum[n][y] =
+                      __builtin_amdgcn_fdot2(a_pair, w_pair, sum[n][y], false);
                 }
               }
             }
@@ -596,56 +620,80 @@ __device__ __forceinline__ void wvSplitK_int4_compute_(
                 }
               }
             } else {
-              // BF16 path: dequant int4 → f32 directly and accumulate
-              // in f32, bypassing expensive bf16 intermediate conversion.
-              // Per-element: v_bfe+v_cvt_f32+v_fmac vs 10.5 ops (2.5x fewer).
-              constexpr float ZP_F = HAS_ZERO_POINTS ? 0.0f : 8.0f;
+              // BF16 path: dequant int4 → fp16 via bit manipulation
+              // (same as fp16 path), convert bf16 activations → fp16,
+              // then use native fdot2 for the dot product.
+              // This is ~2.5× fewer ALU ops than scalar bf16→f32 path.
+              constexpr uint32_t BF16_FP16_MAGIC = 0x64006400u;
+              constexpr uint32_t BF16_BIAS_LO =
+                  HAS_ZERO_POINTS ? 0x64006400u : 0x64086408u;
+              constexpr uint32_t BF16_SCALE16 = 0x2C002C00u;
+              constexpr uint32_t BF16_BIAS_HI =
+                  HAS_ZERO_POINTS ? 0xD400D400u : 0xD480D480u;
+
+              // Temporary fp16 storage for dequantized weights
+              half cvtW_h[A_CHUNK];
+
   #pragma unroll
               for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
                 uint32_t qa = bigB[y][k2].u32[w];
-                // Dequant 8 nibbles to f32 (ExLlama shuffle order)
-                float w0 = (float)(int)(qa & 0xF) - ZP_F;
-                float w1 = (float)(int)((qa >> 16) & 0xF) - ZP_F;
-                float w2 = (float)(int)((qa >> 4) & 0xF) - ZP_F;
-                float w3 = (float)(int)((qa >> 20) & 0xF) - ZP_F;
-                float w4 = (float)(int)((qa >> 8) & 0xF) - ZP_F;
-                float w5 = (float)(int)((qa >> 24) & 0xF) - ZP_F;
-                float w6 = (float)(int)((qa >> 12) & 0xF) - ZP_F;
-                float w7 = (float)(int)((qa >> 28) & 0xF) - ZP_F;
+                uint32_t lo0 = (qa & 0x000F000Fu) | BF16_FP16_MAGIC;
+                uint32_t hi0 = (qa & 0x00F000F0u) | BF16_FP16_MAGIC;
+                qa >>= 8;
+                uint32_t lo1 = (qa & 0x000F000Fu) | BF16_FP16_MAGIC;
+                uint32_t hi1 = (qa & 0x00F000F0u) | BF16_FP16_MAGIC;
 
-                if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
-                  uint32_t group_idx = k_ / GROUP_SIZE;
-                  float zp =
-                      __s2float(zero_points[(m + y) * num_groups + group_idx]);
-                  w0 -= zp;
-                  w1 -= zp;
-                  w2 -= zp;
-                  w3 -= zp;
-                  w4 -= zp;
-                  w5 -= zp;
-                  w6 -= zp;
-                  w7 -= zp;
+                *(half2*)&cvtW_h[w * 8 + 0] =
+                    __hsub2(*(half2*)&lo0, *(const half2*)&BF16_BIAS_LO);
+                *(half2*)&cvtW_h[w * 8 + 2] =
+                    __hfma2(*(half2*)&hi0, *(const half2*)&BF16_SCALE16,
+                            *(const half2*)&BF16_BIAS_HI);
+                *(half2*)&cvtW_h[w * 8 + 4] =
+                    __hsub2(*(half2*)&lo1, *(const half2*)&BF16_BIAS_LO);
+                *(half2*)&cvtW_h[w * 8 + 6] =
+                    __hfma2(*(half2*)&hi1, *(const half2*)&BF16_SCALE16,
+                            *(const half2*)&BF16_BIAS_HI);
+              }
+
+              if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
+                uint32_t group_idx = k_ / GROUP_SIZE;
+                float zp_f =
+                    __s2float(zero_points[(m + y) * num_groups + group_idx]);
+                half zp_h = __float2half(zp_f);
+  #pragma unroll
+                for (uint32_t b = 0; b < A_CHUNK; b++) {
+                  cvtW_h[b] = cvtW_h[b] - zp_h;
                 }
+              }
 
-                // Convert activations bf16 → f32 and dot-product
-                float a0 = __s2float(bigA[n][k2].h[w * 8 + 0]);
-                float a1 = __s2float(bigA[n][k2].h[w * 8 + 1]);
-                float a2 = __s2float(bigA[n][k2].h[w * 8 + 2]);
-                float a3 = __s2float(bigA[n][k2].h[w * 8 + 3]);
-                float a4 = __s2float(bigA[n][k2].h[w * 8 + 4]);
-                float a5 = __s2float(bigA[n][k2].h[w * 8 + 5]);
-                float a6 = __s2float(bigA[n][k2].h[w * 8 + 6]);
-                float a7 = __s2float(bigA[n][k2].h[w * 8 + 7]);
-
-                float dot = w0 * a0 + w1 * a1 + w2 * a2 + w3 * a3 + w4 * a4 +
-                            w5 * a5 + w6 * a6 + w7 * a7;
-
-                if constexpr (GROUP_SIZE > 0) {
-                  uint32_t group_idx = k_ / GROUP_SIZE;
-                  sum[n][y] +=
-                      dot * __s2float(scale[(m + y) * num_groups + group_idx]);
-                } else {
-                  sum[n][y] += dot;
+              // Convert bf16 activations to fp16 and dot product via fdot2
+              if constexpr (GROUP_SIZE > 0) {
+                float partial = 0;
+  #pragma unroll
+                for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                  half a_h0 =
+                      __float2half(__bfloat162float(bigA[n][k2].h[b * 2 + 0]));
+                  half a_h1 =
+                      __float2half(__bfloat162float(bigA[n][k2].h[b * 2 + 1]));
+                  half2 a_pair = {a_h0, a_h1};
+                  half2 w_pair = *(half2*)&cvtW_h[b * 2];
+                  partial =
+                      __builtin_amdgcn_fdot2(a_pair, w_pair, partial, false);
+                }
+                uint32_t group_idx = k_ / GROUP_SIZE;
+                sum[n][y] += partial *
+                             __s2float(scale[(m + y) * num_groups + group_idx]);
+              } else {
+  #pragma unroll
+                for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                  half a_h0 =
+                      __float2half(__bfloat162float(bigA[n][k2].h[b * 2 + 0]));
+                  half a_h1 =
+                      __float2half(__bfloat162float(bigA[n][k2].h[b * 2 + 1]));
+                  half2 a_pair = {a_h0, a_h1};
+                  half2 w_pair = *(half2*)&cvtW_h[b * 2];
+                  sum[n][y] =
+                      __builtin_amdgcn_fdot2(a_pair, w_pair, sum[n][y], false);
                 }
               }
             }
