@@ -290,19 +290,91 @@ jobs:
           role-to-assume: arn:aws:iam::317668459450:role/therock-aig-embd-gfx11-wheels-s3-oidc
           aws-region: us-east-1
 
-      - name: Upload wheel to S3
+      - name: Upload wheel and update PEP 503 index on S3
         run: |
           pip install boto3
           python - <<'PYEOF'
-          import boto3, glob
+          import boto3, glob, hashlib, os
 
           s3 = boto3.client("s3")
           bucket = "aig-embd-gfx11-wheels"
 
+          # 1. Upload new wheel(s) into simple/vllm/
+          new_hashes = {}
           for whl in glob.glob("dist/*.whl"):
-              key = whl.split("/")[-1]
-              print(f"Uploading {key} to s3://{bucket}/{key}")
-              s3.upload_file(whl, bucket, key)
-              print(f"  Done")
+              name = os.path.basename(whl)
+              data = open(whl, "rb").read()
+              sha = hashlib.sha256(data).hexdigest()
+              new_hashes[name] = sha
+              key = f"simple/vllm/{name}"
+              print(f"Uploading {key}  (sha256={sha})")
+              s3.upload_file(whl, bucket, key,
+                             ExtraArgs={"ContentType": "application/zip"})
+
+          # 2. List all wheels in simple/vllm/ and compute hashes
+          #    For newly uploaded wheels we already have the hash;
+          #    for existing wheels read the ETag (S3 MD5) — but we
+          #    need sha256, so download the object to hash it.
+          paginator = s3.get_paginator("list_objects_v2")
+          wheels = {}  # filename -> sha256
+          for page in paginator.paginate(Bucket=bucket, Prefix="simple/vllm/"):
+              for obj in page.get("Contents", []):
+                  k = obj["Key"]
+                  if not k.endswith(".whl"):
+                      continue
+                  name = os.path.basename(k)
+                  if name in new_hashes:
+                      wheels[name] = new_hashes[name]
+                  else:
+                      resp = s3.get_object(Bucket=bucket, Key=k)
+                      data = resp["Body"].read()
+                      wheels[name] = hashlib.sha256(data).hexdigest()
+
+          print(f"Total wheels in simple/vllm/: {len(wheels)}")
+
+          # 3. Generate simple/vllm/index.html (PEP 503 package index)
+          links = []
+          for name in sorted(wheels, reverse=True):
+              sha = wheels[name]
+              links.append(
+                  f'    <a href="{name}#sha256={sha}">{name}</a>')
+          pkg_index = (
+              '<!DOCTYPE html>\n<html>\n'
+              '  <head>\n'
+              '    <meta name="pypi:repository-version" content="1.0">\n'
+              '    <title>vllm</title>\n'
+              '  </head>\n'
+              '  <body>\n'
+              + "\n".join(links) + "\n"
+              '  </body>\n</html>\n'
+          )
+          s3.put_object(Bucket=bucket, Key="simple/vllm/index.html",
+                        Body=pkg_index, ContentType="text/html")
+          print("Uploaded simple/vllm/index.html")
+
+          # 4. Generate simple/index.html (PEP 503 root index)
+          result = s3.list_objects_v2(Bucket=bucket, Prefix="simple/",
+                                      Delimiter="/")
+          packages = []
+          for prefix in result.get("CommonPrefixes", []):
+              pkg = prefix["Prefix"].removeprefix("simple/").rstrip("/")
+              if pkg:
+                  packages.append(pkg)
+
+          pkg_links = "\n".join(
+              f'    <a href="{p}/">{p}</a>' for p in sorted(packages))
+          root_index = (
+              '<!DOCTYPE html>\n<html>\n'
+              '  <head>\n'
+              '    <meta name="pypi:repository-version" content="1.0">\n'
+              '    <title>ROCm Wheels</title>\n'
+              '  </head>\n'
+              '  <body>\n'
+              + pkg_links + "\n"
+              '  </body>\n</html>\n'
+          )
+          s3.put_object(Bucket=bucket, Key="simple/index.html",
+                        Body=root_index, ContentType="text/html")
+          print("Uploaded simple/index.html")
           PYEOF
 
