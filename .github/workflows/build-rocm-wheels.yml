@@ -8,6 +8,9 @@ on:
       - main
       - 'matthias.awq_gemv'
       - 'release/*'
+  pull_request:
+    branches:
+      - 'matthias.awq_gemv'
   workflow_dispatch:
     inputs:
       pytorch_index:
@@ -66,6 +69,11 @@ jobs:
 
       - name: Install and configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdrm-dev
 
       - name: Install build dependencies
         run: |
@@ -178,6 +186,7 @@ jobs:
           ls -la
 
       - name: Upload wheel artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: vllm-rocm-wheel
@@ -185,6 +194,7 @@ jobs:
           retention-days: 90
 
       - name: Generate wheel index
+        if: github.event_name != 'pull_request'
         run: |
           python scripts/generate-wheel-index.py \
             --wheels-dir dist \
@@ -192,6 +202,7 @@ jobs:
             --base-url "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/wheels"
 
       - name: Upload index artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: wheel-index
@@ -199,6 +210,7 @@ jobs:
           retention-days: 90
 
   create-release:
+    if: github.event_name != 'pull_request'
     needs: build-wheel
     runs-on: ubuntu-latest
     permissions:
@@ -248,6 +260,7 @@ jobs:
             ```
 
   publish-to-gh-pages:
+    if: github.event_name != 'pull_request'
     needs: create-release
     runs-on: ubuntu-latest
     permissions:
