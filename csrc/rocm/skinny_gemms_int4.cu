@@ -17,16 +17,8 @@
   #define __HIP__GFX9__
 #endif
 
-#if defined(__HIPCC__) && defined(__GFX11__)
-  #define __HIP__GFX11__
-#endif
-
-#if defined(__HIPCC__) && defined(__GFX12__)
-  #define __HIP__GFX12__
-#endif
-
 // Combined RDNA macro (gfx11 + gfx12) - both use 32-wide wavefronts
-#if defined(__HIP__GFX11__) || defined(__HIP__GFX12__)
+#if defined(__GFX11__) || defined(__GFX12__)
   #define __HIP__GFX1X__
 #endif
 

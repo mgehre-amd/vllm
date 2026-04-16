@@ -17,10 +17,6 @@
   #define __HIP__GFX9__
 #endif
 
-#if defined(__HIPCC__) && defined(__GFX11__)
-  #define __HIP__GFX11__
-#endif
-
 #define LDS_SIZE 64 * 1024
 
 int get_lds_size_int8() {
@@ -108,7 +104,7 @@ struct scalar<c10::BFloat16> {
     V0 += (s.x + s.y);                                                      \
   }
 
-#if defined(__HIP__GFX11__)
+#if defined(__GFX11__)
   #define REDUCE_SUM_WAVE32(val)  \
     do {                          \
       val += __shfl_xor(val, 1);  \
@@ -126,7 +122,7 @@ __device__ inline unsigned int min__(uint32_t a, uint32_t b) {
 // W8A16 skinny GEMM kernel: int8 weights, fp16/bf16 activations
 // Targets the "sml" case where activations fit in LDS.
 // A_CHUNK=16: each thread processes 16 int8 weight elements per step.
-#if defined(__HIP__GFX9__) || defined(__HIP__GFX11__)
+#if defined(__HIP__GFX9__) || defined(__GFX11__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
           int UNRL, int N>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
@@ -234,7 +230,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     }
 
     // Reduction
-  #if defined(__HIP__GFX11__)
+  #if defined(__GFX11__)
     for (int n = 0; n < N; n++)
       for (int y = 0; y < YTILE; y++) REDUCE_SUM_WAVE32(sum[n][y]);
 
@@ -280,11 +276,11 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         }
       }
     }
-  #endif  // defined(__HIP__GFX11__)
+  #endif  // defined(__GFX11__)
     m += CuCount * _WvPrGrp * YTILE;
   }
 }
-#else   // !defined(__HIP__GFX9__) && !defined(__HIP__GFX11__)
+#else   // !defined(__HIP__GFX9__) && !defined(__GFX11__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
           int UNRL, int N>
 __global__ void wvSplitK_int8_hf_sml_(const int K, const int M, const int Bx,
@@ -296,7 +292,7 @@ __global__ void wvSplitK_int8_hf_sml_(const int K, const int M, const int Bx,
                                       const int CuCount) {
   UNREACHABLE_CODE
 }
-#endif  // defined(__HIP__GFX9__) || defined(__HIP__GFX11__)
+#endif  // defined(__HIP__GFX9__) || defined(__GFX11__)
 
 int mindiv_int8(int N, int div1, int div2) {
   int nPrRnd = div1 * div2;
