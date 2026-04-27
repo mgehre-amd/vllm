@@ -1,0 +1,62 @@
+# CI image for gfx11 (RDNA 3.5 / Strix) vLLM wheel builds and kernel tests.
+# Pre-bakes ROCm SDK (from pip), PyTorch, sccache, and uv so that CI jobs
+# skip the 15-20 minute setup overhead.
+#
+# Build:
+#   docker build -f docker/Dockerfile.gfx11-ci .
+# Override ROCm nightly index or PyTorch version:
+#   docker build --build-arg ROCM_NIGHTLY_INDEX=https://... \
+#                --build-arg PYTORCH_VERSION=2.10.0 \
+#                -f docker/Dockerfile.gfx11-ci .
+
+FROM python:3.12-bookworm
+
+ARG ROCM_NIGHTLY_INDEX=https://rocm.nightlies.amd.com/v2/gfx1151
+ARG PYTORCH_VERSION=2.10.0
+ARG SCCACHE_VERSION=v0.14.0
+
+# System build tools
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+    git curl cmake ninja-build gcc g++ \
+    libdrm-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create render and video groups so `--group-add render`/`--group-add video`
+# can resolve the names at container start (the host's /dev/dri/renderD* is
+# typically owned by group `render`, which doesn't exist in python:bookworm).
+RUN groupadd -r render && groupadd -rf video
+
+# sccache
+RUN curl -L "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    | tar xz --strip-components=1 -C /usr/local/bin --wildcards '*/sccache' \
+    && sccache --version
+
+# uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/usr/local/bin" sh \
+    && uv --version
+
+# ROCm SDK from pip nightly wheels.
+# Pin rocm>=6 to skip the dummy 'rocm' 0.1.0 on PyPI and pick up the real
+# nightly package (e.g. 7.13.0a20260413).
+RUN uv pip install --system --no-cache "rocm[devel,libraries]>=6" \
+    --index-url ${ROCM_NIGHTLY_INDEX} --extra-index-url https://pypi.org/simple \
+    --index-strategy unsafe-first-match --prerelease allow \
+    && rocm-sdk init
+
+# ROCm environment variables (site-packages path is stable in official Python images)
+ENV ROCM_PATH=/usr/local/lib/python3.12/site-packages/_rocm_sdk_devel
+ENV HIP_DEVICE_LIB_PATH=/usr/local/lib/python3.12/site-packages/_rocm_sdk_core/lib/llvm/amdgcn/bitcode
+ENV PATH=/usr/local/lib/python3.12/site-packages/_rocm_sdk_devel/bin:$PATH
+ENV PYTHONPATH=/usr/local/lib/python3.12/site-packages/_rocm_sdk_core/share/amd_smi
+
+# Verify hipcc is functional
+RUN hipcc --version
+
+# Pre-install PyTorch ROCm nightly (largest dependency, ~2 GB).
+# Use --index-url exclusively (no PyPI fallback) to ensure the ROCm build
+# is installed, not the CUDA build from PyPI which has the same base version.
+RUN uv pip install --system --no-cache torch==${PYTORCH_VERSION} \
+    --index-url ${ROCM_NIGHTLY_INDEX} \
+    && python -c "import torch; assert torch.version.hip, 'Expected ROCm PyTorch'; print(f'PyTorch {torch.__version__}, HIP: {torch.version.hip}')"
+
+LABEL org.opencontainers.image.description="gfx11 CI image for vLLM wheel builds and kernel tests"

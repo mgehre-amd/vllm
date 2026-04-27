@@ -46,7 +46,7 @@ def query_marlin_supported_quant_types(
     if current_platform.is_cpu():
         return _query_cpu_marlin_supported_quant_types(has_zp, include_fp_type)
 
-    if not current_platform.is_rocm():
+    if current_platform.is_cuda():
         if device_capability is None:
             capability_tuple = current_platform.get_device_capability()
             device_capability = (

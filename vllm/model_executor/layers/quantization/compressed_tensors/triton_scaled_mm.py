@@ -7,6 +7,7 @@ from contextlib import nullcontext
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 
 
 def is_weak_contiguous(x: torch.Tensor):
@@ -166,17 +167,13 @@ _gfx11_decode_tile_config: dict[tuple[int, int], tuple[int, int, int]] = {
 
 # input   - [M, K]
 # weight - [K, N]
-def triton_scaled_mm(
+def _triton_scaled_mm_impl(
     input: torch.Tensor,
     weight: torch.Tensor,
     scale_a: torch.Tensor,
     scale_b: torch.Tensor,
-    out_dtype: type[torch.dtype],
+    out_dtype: torch.dtype,
     bias: torch.Tensor | None = None,
-    block_size_m: int = 32,
-    block_size_n: int = 32,
-    block_size_k: int = 32,
-    use_heuristic=True,
 ) -> torch.Tensor:
     M, K = input.shape
     N = weight.shape[1]
@@ -204,29 +201,28 @@ def triton_scaled_mm(
 
     has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
 
-    if use_heuristic:
-        from vllm.platforms import current_platform
+    from vllm.platforms import current_platform
 
-        is_small_N = N < 8192
-        next_power_of_2_M = max(32, triton.next_power_of_2(M))
-        gfx11_tile = None
+    is_small_N = N < 8192
+    next_power_of_2_M = max(32, triton.next_power_of_2(M))
+    gfx11_tile = None
 
-        if current_platform.is_rocm():
-            from vllm.platforms.rocm import on_gfx11
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx11
 
-            if on_gfx11() and next_power_of_2_M <= 32:
-                gfx11_tile = _gfx11_decode_tile_config.get((N, K), (128, 32, 256))
+        if on_gfx11() and next_power_of_2_M <= 32:
+            gfx11_tile = _gfx11_decode_tile_config.get((N, K), (128, 32, 256))
 
-        if gfx11_tile is not None:
-            tile_shape = gfx11_tile
-        elif next_power_of_2_M <= 32:
-            tile_shape = (64, 64, 256) if is_small_N else (64, 128, 256)
-        elif next_power_of_2_M <= 64:
-            tile_shape = (64, 64, 256)
-        elif next_power_of_2_M <= 128:
-            tile_shape = (64, 128, 128)
-        else:
-            tile_shape = (128, 128, 128)
+    if gfx11_tile is not None:
+        tile_shape = gfx11_tile
+    elif next_power_of_2_M <= 32:
+        tile_shape = (64, 64, 256) if is_small_N else (64, 128, 256)
+    elif next_power_of_2_M <= 64:
+        tile_shape = (64, 64, 256)
+    elif next_power_of_2_M <= 128:
+        tile_shape = (64, 128, 128)
+    else:
+        tile_shape = (128, 128, 128)
 
     block_size_m, block_size_n, block_size_k = tile_shape
 
@@ -276,3 +272,50 @@ def triton_scaled_mm(
         )
 
     return result.to(out_dtype)
+
+
+def _triton_scaled_mm_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.empty(
+        (input.shape[0], weight.shape[1]), dtype=out_dtype, device=input.device
+    )
+
+
+# Register as an opaque custom op so torch.compile does not inline the
+# Python-level shape inspection (e.g. triton.next_power_of_2(M)) used by the
+# tile heuristic. Inlining specializes the dynamic token-count dim and breaks
+# dynamic-shape compilation.
+direct_register_custom_op(
+    op_name="triton_scaled_mm",
+    op_func=_triton_scaled_mm_impl,
+    mutates_args=[],
+    fake_impl=_triton_scaled_mm_fake,
+)
+
+
+# input   - [M, K]
+# weight - [K, N]
+def triton_scaled_mm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+    block_size_m: int = 32,
+    block_size_n: int = 32,
+    block_size_k: int = 32,
+    use_heuristic: bool = True,
+) -> torch.Tensor:
+    # block_size_* and use_heuristic are accepted for backwards compatibility
+    # but ignored: the kernel always uses its tuned heuristic.
+    del block_size_m, block_size_n, block_size_k, use_heuristic
+    return torch.ops.vllm.triton_scaled_mm(
+        input, weight, scale_a, scale_b, out_dtype, bias
+    )

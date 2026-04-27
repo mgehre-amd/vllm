@@ -6,9 +6,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 from torch.nn import Parameter
+from transformers import PretrainedConfig
 
 import vllm.model_executor.layers.fused_moe  # noqa
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     MPLinearLayerConfig,
@@ -230,8 +232,13 @@ class AWQMarlinConfig(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(
-        cls, hf_quant_cfg, user_quant
+        cls, hf_quant_cfg, user_quant, hf_config=None
     ) -> "QuantizationMethods | None":
+        # Skip override to marlin kernels, as they are not
+        # batch invariant
+        if envs.VLLM_BATCH_INVARIANT:
+            return None
+
         can_convert = cls.is_awq_marlin_compatible(hf_quant_cfg)
         is_valid_user_quant = (
             user_quant is None or user_quant == "marlin" or user_quant == "awq_marlin"
@@ -332,7 +339,12 @@ class AWQMarlinConfig(QuantizationConfig):
                 self.modules_to_not_convert
             )
 
-    def maybe_update_config(self, model_name: str, revision: str | None = None):
+    def maybe_update_config(
+        self,
+        model_name: str,
+        hf_config: PretrainedConfig | None = None,
+        revision: str | None = None,
+    ):
         if self.modules_to_not_convert:
             return
 
@@ -425,19 +437,6 @@ class AWQMarlinLinearMethod(LinearMethodBase):
 
         num_groups = input_size_per_partition // group_size
 
-        qzeros = PackedvLLMParameter(
-            data=torch.empty(
-                num_groups,
-                output_size_per_partition // self.quant_config.pack_factor,
-                dtype=torch.int32,
-            ),
-            input_dim=0,
-            output_dim=1,
-            packed_dim=1,
-            packed_factor=self.quant_config.pack_factor,
-            weight_loader=weight_loader,
-        )
-
         scales = GroupQuantScaleParameter(
             data=torch.empty(
                 num_groups,
@@ -450,14 +449,28 @@ class AWQMarlinLinearMethod(LinearMethodBase):
         )
 
         layer.register_parameter("qweight", qweight)
-        layer.register_parameter("qzeros", qzeros)
         layer.register_parameter("scales", scales)
+
+        if self.quant_config.zero_point:
+            qzeros = PackedvLLMParameter(
+                data=torch.empty(
+                    num_groups,
+                    output_size_per_partition // self.quant_config.pack_factor,
+                    dtype=torch.int32,
+                ),
+                input_dim=0,
+                output_dim=1,
+                packed_dim=1,
+                packed_factor=self.quant_config.pack_factor,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("qzeros", qzeros)
 
         self.kernel = kernel_type(
             mp_linear_kernel_config,
             w_q_param_name="qweight",
             w_s_param_name="scales",
-            w_zp_param_name="qzeros",
+            w_zp_param_name="qzeros" if self.quant_config.zero_point else None,
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -805,7 +818,7 @@ class AWQMarlinMoEMethod(FusedMoEMethodBase):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         return fused_marlin_moe(
             x,
             layer.w13_qweight,
