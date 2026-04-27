@@ -82,9 +82,9 @@ jobs:
 
       - name: Install PyTorch, ROCm SDK and build deps
         run: |
-          # Install from rocm-build.txt (pins torch==2.10.0 etc.)
+          # Install from build/rocm.txt (pins torch, triton, etc.)
           # Use nightly index instead of the default ROCm test index in the file
-          pip install -r requirements/rocm-build.txt \
+          pip install -r requirements/build/rocm.txt \
             --extra-index-url ${{ env.PYTORCH_INDEX_URL }}
           
           # Install ROCm SDK with devel and libraries extras
@@ -145,7 +145,7 @@ jobs:
 
       - name: Install remaining vLLM build requirements
         run: |
-          # build.txt has additional deps not in rocm-build.txt (e.g. grpcio-tools)
+          # build.txt has additional deps not in build/rocm.txt (e.g. grpcio-tools)
           pip install -r requirements/build.txt --extra-index-url ${{ env.PYTORCH_INDEX_URL }}
 
       - name: Build wheel
