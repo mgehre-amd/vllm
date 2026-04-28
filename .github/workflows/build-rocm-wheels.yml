@@ -82,22 +82,22 @@ jobs:
 
       - name: Install PyTorch, ROCm SDK and build deps
         run: |
-          # Install from build/rocm.txt (pins torch, triton, etc.)
-          # Use nightly index instead of the default ROCm test index in the file
-          pip install -r requirements/build/rocm.txt \
-            --extra-index-url ${{ env.PYTORCH_INDEX_URL }}
-          
+          # Install from build/rocm.txt, stripping amdsmi (use rocm-sdk-core's bundled copy via PYTHONPATH)
+          grep -v '^amdsmi' requirements/build/rocm.txt > /tmp/rocm-ci.txt
+          pip install -r /tmp/rocm-ci.txt \
+            --index-url ${{ env.PYTORCH_INDEX_URL }}
+
           # Install ROCm SDK with devel and libraries extras
-          pip install "rocm[devel,libraries]" --extra-index-url ${{ env.PYTORCH_INDEX_URL }} || \
+          pip install "rocm[devel,libraries]" --index-url ${{ env.PYTORCH_INDEX_URL }} || \
             echo "Warning: Could not install rocm[devel,libraries]"
-          
+
           # Initialize ROCm SDK (creates symlinks, etc.)
           rocm-sdk init || echo "Warning: rocm-sdk init failed"
-          
+
           # Use amdsmi bundled in rocm-sdk-core (not the PyPI package)
           SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
           export PYTHONPATH="$SITE_PACKAGES/_rocm_sdk_core/share/amd_smi${PYTHONPATH:+:$PYTHONPATH}"
-          
+
           # Show what's installed
           pip list | grep -i -E "rocm|torch|sdk" || true
           python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'HIP: {torch.version.hip}'); print(f'CUDA: {torch.version.cuda}')"
@@ -146,7 +146,7 @@ jobs:
       - name: Install remaining vLLM build requirements
         run: |
           # build.txt has additional deps not in build/rocm.txt (e.g. grpcio-tools)
-          pip install -r requirements/build.txt --extra-index-url ${{ env.PYTORCH_INDEX_URL }}
+          pip install -r requirements/build.txt --index-url ${{ env.PYTORCH_INDEX_URL }}
 
       - name: Build wheel
         env:
