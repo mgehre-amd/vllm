@@ -83,8 +83,8 @@ jobs:
       - name: Install PyTorch, ROCm SDK and build deps
         run: |
           # Install from build/rocm.txt, stripping amdsmi (use rocm-sdk-core's bundled copy via PYTHONPATH)
-          grep -v '^amdsmi' requirements/build/rocm.txt > /tmp/rocm-ci.txt
-          pip install -r /tmp/rocm-ci.txt \
+          grep -v '^amdsmi' requirements/build/rocm.txt > requirements/build/rocm-ci.txt
+          pip install -r requirements/build/rocm-ci.txt \
             --index-url ${{ env.PYTORCH_INDEX_URL }}
 
           # Install ROCm SDK with devel and libraries extras
