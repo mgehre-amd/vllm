@@ -163,6 +163,8 @@ jobs:
           echo "sccache stats before build:"
           sccache --show-stats || true
           echo ""
+          echo "=== Debug torch ==="
+          python -c "import torch; print('hip:', torch.version.hip, 'cuda:', torch.version.cuda)"
           echo "=== Building wheel ==="
           python setup.py bdist_wheel --dist-dir=dist
           echo ""
