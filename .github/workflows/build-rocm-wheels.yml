@@ -145,11 +145,6 @@ jobs:
           which hipcc || echo "hipcc not found in PATH"
           head -50 "$(which hipcc)" 2>/dev/null || true
 
-      - name: Install remaining vLLM build requirements
-        run: |
-          # build.txt has additional deps not in build/rocm.txt (e.g. grpcio-tools)
-          pip install -r requirements/build.txt --index-url ${{ env.PYTORCH_INDEX_URL }} --extra-index-url https://pypi.org/simple/
-
       - name: Build wheel
         env:
           PYTORCH_ROCM_ARCH: ${{ env.PYTORCH_ROCM_ARCH }}
