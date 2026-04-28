@@ -83,12 +83,14 @@ jobs:
       - name: Install PyTorch, ROCm SDK and build deps
         run: |
           # Install from build/rocm.txt, stripping amdsmi (use rocm-sdk-core's bundled copy via PYTHONPATH)
-          grep -v '^amdsmi' requirements/build/rocm.txt > requirements/build/rocm-ci.txt
+          # and the embedded --extra-index-url (we use the nightly index instead)
+          grep -v -E '^amdsmi|^--extra-index-url' requirements/build/rocm.txt > requirements/build/rocm-ci.txt
           pip install -r requirements/build/rocm-ci.txt \
-            --index-url ${{ env.PYTORCH_INDEX_URL }}
+            --index-url ${{ env.PYTORCH_INDEX_URL }} \
+            --extra-index-url https://pypi.org/simple/
 
           # Install ROCm SDK with devel and libraries extras
-          pip install "rocm[devel,libraries]" --index-url ${{ env.PYTORCH_INDEX_URL }} || \
+          pip install "rocm[devel,libraries]" --index-url ${{ env.PYTORCH_INDEX_URL }} --extra-index-url https://pypi.org/simple/ || \
             echo "Warning: Could not install rocm[devel,libraries]"
 
           # Initialize ROCm SDK (creates symlinks, etc.)
@@ -146,7 +148,7 @@ jobs:
       - name: Install remaining vLLM build requirements
         run: |
           # build.txt has additional deps not in build/rocm.txt (e.g. grpcio-tools)
-          pip install -r requirements/build.txt --index-url ${{ env.PYTORCH_INDEX_URL }}
+          pip install -r requirements/build.txt --index-url ${{ env.PYTORCH_INDEX_URL }} --extra-index-url https://pypi.org/simple/
 
       - name: Build wheel
         env:
