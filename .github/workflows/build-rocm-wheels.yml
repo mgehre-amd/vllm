@@ -82,9 +82,12 @@ jobs:
 
       - name: Install PyTorch, ROCm SDK and build deps
         run: |
-          # Install from build/rocm.txt, stripping amdsmi (use rocm-sdk-core's bundled copy via PYTHONPATH)
-          # and the embedded --extra-index-url (we use the nightly index instead)
-          grep -v -E '^amdsmi|^--extra-index-url' requirements/build/rocm.txt > requirements/build/rocm-ci.txt
+          # 1) Install torch from the nightly ROCm index only (no PyPI fallback)
+          pip install torch torchvision torchaudio \
+            --index-url ${{ env.PYTORCH_INDEX_URL }}
+
+          # 2) Install remaining build deps from rocm.txt, stripping torch/amdsmi/index lines
+          grep -v -E '^(torch|torchvision|torchaudio)==|^amdsmi|^--extra-index-url' requirements/build/rocm.txt > requirements/build/rocm-ci.txt
           pip install -r requirements/build/rocm-ci.txt \
             --index-url ${{ env.PYTORCH_INDEX_URL }} \
             --extra-index-url https://pypi.org/simple/
